@@ -18,6 +18,11 @@ output "glue_database_name" {
   description = "Glue Catalog Database Name (Bronze JSON)"
 }
 
+output "glue_silver_database_name" {
+  value       = module.glue.silver_crawler_name
+  description = "Glue Silver Crawler Name (runs between bronze_to_silver and silver_to_gold)"
+}
+
 output "glue_gold_database_name" {
   value       = module.glue.gold_database_name
   description = "Glue Catalog Gold Database Name (BI/ML/RAG Parquet)"
@@ -26,4 +31,9 @@ output "glue_gold_database_name" {
 output "glue_workflow_name" {
   value       = module.glue.workflow_name
   description = "Glue ETL Workflow Name"
+}
+
+output "glue_silver_crawler_name" {
+  value       = module.glue.silver_crawler_name
+  description = "Glue Silver Crawler Name (runs after bronze_to_silver, before silver_to_gold)"
 }

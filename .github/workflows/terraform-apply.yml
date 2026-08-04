@@ -21,8 +21,11 @@ jobs:
         working-directory: ./infra
 
     outputs:
-      bronze_bucket: ${{ steps.tf_outputs.outputs.bronze_bucket }}
-      glue_workflow: ${{ steps.tf_outputs.outputs.glue_workflow }}
+      bronze_bucket:    ${{ steps.tf_outputs.outputs.bronze_bucket }}
+      silver_bucket:    ${{ steps.tf_outputs.outputs.silver_bucket }}
+      gold_bucket:      ${{ steps.tf_outputs.outputs.gold_bucket }}
+      glue_workflow:    ${{ steps.tf_outputs.outputs.glue_workflow }}
+      silver_crawler:   ${{ steps.tf_outputs.outputs.silver_crawler }}
 
     steps:
       - name: Checkout
@@ -65,8 +68,11 @@ jobs:
       - name: Capture Terraform Outputs
         id: tf_outputs
         run: |
-          echo "bronze_bucket=$(terraform output -raw bronze_bucket_name)" >> $GITHUB_OUTPUT
-          echo "glue_workflow=$(terraform output -raw glue_workflow_name)"  >> $GITHUB_OUTPUT
+          echo "bronze_bucket=$(terraform output -raw bronze_bucket_name)"       >> $GITHUB_OUTPUT
+          echo "silver_bucket=$(terraform output -raw silver_bucket_name)"       >> $GITHUB_OUTPUT
+          echo "gold_bucket=$(terraform output -raw gold_bucket_name)"           >> $GITHUB_OUTPUT
+          echo "glue_workflow=$(terraform output -raw glue_workflow_name)"       >> $GITHUB_OUTPUT
+          echo "silver_crawler=$(terraform output -raw glue_silver_crawler_name)" >> $GITHUB_OUTPUT
 
   # ────────────────────────────────────────────────────────────────────────
   # JOB 2 — Ingest: download from Kaggle → upload to Bronze S3 → trigger Glue
@@ -164,5 +170,6 @@ jobs:
           python ingestion/trigger_gold.py \
             "yelp-bigdata_silver_to_gold" \
             "yelp-bigdata_gold_crawler" \
-            "yelp-gold-analytics-us-east-1"
+            "${{ needs.terraform.outputs.gold_bucket || 'yelp-gold-analytics-us-east-1' }}" \
+            "${{ needs.terraform.outputs.silver_crawler || 'yelp-bigdata_silver_crawler' }}"
 

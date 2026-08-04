@@ -6,6 +6,11 @@ resource "aws_glue_catalog_database" "yelp_db" {
   description = "Glue Catalog for Yelp Bronze JSON tables (crawled from S3)"
 }
 
+resource "aws_glue_catalog_database" "yelp_db_silver" {
+  name        = "yelp_db_silver"
+  description = "Glue Catalog for Yelp Silver Parquet tables (crawled after bronze_to_silver ETL)"
+}
+
 resource "aws_glue_catalog_database" "yelp_db_gold" {
   name        = "yelp_db_gold"
   description = "Glue Catalog for Yelp Gold analytics tables (BI + ML + RAG)"
@@ -77,6 +82,35 @@ resource "aws_glue_crawler" "bronze_crawler" {
     Version = 1.0
     Grouping = {
       TableGroupingPolicy = "CombineCompatibleSchemas"
+    }
+  })
+}
+
+# Silver Crawler: crawls Parquet written by bronze_to_silver → registers in yelp_db_silver
+# CRITICAL: Must run AFTER bronze_to_silver and BEFORE silver_to_gold so the Gold job always
+# reads from a freshly catalogued, up-to-date schema and never hits stale/missing file errors.
+resource "aws_glue_crawler" "silver_crawler" {
+  name          = "${var.project_name}_silver_crawler"
+  database_name = aws_glue_catalog_database.yelp_db_silver.name
+  role          = local.role_arn
+  description   = "Crawls Silver Parquet tables after bronze_to_silver ETL writes them"
+
+  s3_target {
+    path = "s3://${var.silver_bucket_id}/silver/"
+  }
+
+  configuration = jsonencode({
+    Version = 1.0
+    Grouping = {
+      TableGroupingPolicy = "CombineCompatibleSchemas"
+    }
+    CrawlerOutput = {
+      Partitions = {
+        AddOrUpdateBehavior = "InheritFromTable"
+      }
+      Tables = {
+        AddOrUpdateBehavior = "MergeNewColumns"
+      }
     }
   })
 }
@@ -156,15 +190,16 @@ resource "aws_glue_job" "silver_to_gold" {
 
 # ─────────────────────────────────────────────
 # GLUE WORKFLOW + TRIGGERS
-# Sequence:
-#   1. Bronze Crawler (crawls raw JSON → yelp_db)
-#   2. bronze_to_silver Job (writes Parquet → Silver S3)
-#   3. silver_to_gold Job (writes Parquet BI/ML/RAG → Gold S3)
-#   4. Gold Crawler (crawls Gold S3 → yelp_db_gold)
+# Updated Sequence:
+#   1. Bronze Crawler  (crawls raw JSON → yelp_db)
+#   2. bronze_to_silver Job  (writes Parquet → Silver S3)
+#   3. Silver Crawler  (crawls Silver S3 → yelp_db_silver) ← NEW: ensures fresh schema
+#   4. silver_to_gold Job  (writes Parquet BI/ML/RAG → Gold S3)
+#   5. Gold Crawler  (crawls Gold S3 → yelp_db_gold)
 # ─────────────────────────────────────────────
 resource "aws_glue_workflow" "etl_workflow" {
   name        = "${var.project_name}_etl_workflow"
-  description = "Yelp Full Medallion ETL: Bronze Crawler → Bronze-to-Silver Job → Silver-to-Gold Job → Gold Crawler"
+  description = "Yelp Full Medallion ETL: Bronze Crawler → Bronze-to-Silver Job → Silver Crawler → Silver-to-Gold Job → Gold Crawler"
 }
 
 # Trigger 1: start Bronze Crawler on demand (ingest.py calls start-workflow-run)
@@ -196,9 +231,10 @@ resource "aws_glue_trigger" "start_bronze_to_silver" {
   }
 }
 
-# Trigger 3: after bronze_to_silver job succeeds → run silver_to_gold job
-resource "aws_glue_trigger" "start_silver_to_gold" {
-  name          = "${var.project_name}_trigger_silver_to_gold"
+# Trigger 3: after bronze_to_silver job succeeds → run Silver Crawler
+# This is the key fix: cataloguing updated Silver schema BEFORE silver_to_gold runs.
+resource "aws_glue_trigger" "start_silver_crawler" {
+  name          = "${var.project_name}_trigger_silver_crawler"
   type          = "CONDITIONAL"
   workflow_name = aws_glue_workflow.etl_workflow.name
 
@@ -210,11 +246,29 @@ resource "aws_glue_trigger" "start_silver_to_gold" {
   }
 
   actions {
+    crawler_name = aws_glue_crawler.silver_crawler.name
+  }
+}
+
+# Trigger 4: after Silver Crawler succeeds → run silver_to_gold job
+resource "aws_glue_trigger" "start_silver_to_gold" {
+  name          = "${var.project_name}_trigger_silver_to_gold"
+  type          = "CONDITIONAL"
+  workflow_name = aws_glue_workflow.etl_workflow.name
+
+  predicate {
+    conditions {
+      crawler_name = aws_glue_crawler.silver_crawler.name
+      crawl_state  = "SUCCEEDED"
+    }
+  }
+
+  actions {
     job_name = aws_glue_job.silver_to_gold.name
   }
 }
 
-# Trigger 4: after silver_to_gold job succeeds → run Gold Crawler
+# Trigger 5: after silver_to_gold job succeeds → run Gold Crawler
 resource "aws_glue_trigger" "start_gold_crawler" {
   name          = "${var.project_name}_trigger_gold_crawler"
   type          = "CONDITIONAL"
