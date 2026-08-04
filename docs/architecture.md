@@ -1,97 +1,51 @@
-# Final Architecture Documentation — Yelp Big Data Platform
+# Yelp Big Data Architecture
 
-This document describes the design, execution flow, and architectural principles of the automated Yelp Big Data pipeline.
+## Current Pipeline Scope (Phase 1 + 2)
 
----
-
-## High-Level Architecture Diagram
-
-```mermaid
-flowchart TD
-    Dev([Developer]) -->|Push / PR| GithubRepo[GitHub Repository]
-    
-    subgraph CI_CD [GitHub Actions Workflows]
-        RepoPlan[terraform-plan.yml]
-        RepoApply[terraform-apply.yml]
-        RepoIngest[ingest.yml]
-        RepoDestroy[terraform-destroy.yml]
-    end
-
-    GithubRepo --> CI_CD
-
-    subgraph State_Management [Infrastructure Deployment]
-        HCP[HCP Terraform / Local Backend]
-        TF[Terraform Engine]
-    end
-
-    RepoApply --> HCP --> TF
-    TF --> AWS_Infra[AWS Infrastructure Provisioned]
-
-    subgraph AWS_Cloud [AWS Cloud Environment]
-        subgraph Storage [Amazon S3 Data Lake]
-            Bronze[(s3://bucket/bronze/)]
-            Silver[(s3://bucket/silver/)]
-            Gold[(s3://bucket/gold/)]
-            Scripts[(s3://bucket/scripts/)]
-            AthenaRes[(s3://bucket/athena-results/)]
-        end
-
-        subgraph Ingestion [Data Acquisition]
-            Kaggle[Kaggle API]
-            PyIngest[ingest.py Script]
-        end
-
-        subgraph ETL [AWS Glue Serverless ETL]
-            Job1[Glue Job 1: Bronze -> Silver]
-            Job2[Glue Job 2: Silver -> Gold]
-            Workflow[Glue Workflow Orchestrator]
-            Crawler[Glue Crawler]
-            Catalog[(Glue Data Catalog DB)]
-        end
-
-        subgraph Monitoring [Observability]
-            CW[CloudWatch Log Groups]
-        end
-
-        subgraph Analytics [Data Serving]
-            Athena[Amazon Athena SQL]
-            PowerBI[Power BI Dashboard]
-        end
-    end
-
-    RepoIngest --> PyIngest
-    PyIngest -->|Download & Unzip| Kaggle
-    PyIngest -->|Filter photos/ & Upload JSON| Bronze
-    PyIngest -->|Trigger Workflow| Workflow
-
-    Workflow --> Job1
-    Job1 -->|Clean & Partition Parquet| Silver
-    Job1 --> Job2
-    Job2 -->|Aggregate & Joins| Gold
-    Job2 --> Crawler
-    Crawler --> Catalog
-
-    Catalog --> Athena
-    AthenaRes --> Athena
-    Athena --> PowerBI
-    Workflow --> CW
+```
+Developer pushes to main
+        │
+        ▼
+GitHub Actions (terraform-apply.yml)
+        │
+        ├── Job 1: Terraform Apply
+        │       ├── S3 Bronze Bucket  (yelp-bronze-raw-us-east-1)
+        │       ├── S3 Silver Bucket  (yelp-silver-clean-us-east-1)
+        │       ├── Glue Catalog DB   (yelp_db)
+        │       ├── Glue Crawler      (bronze_crawler)
+        │       ├── Glue Job          (bronze_to_silver)
+        │       └── Glue Workflow     (yelp-bigdata_etl_workflow)
+        │
+        └── Job 2: Kaggle Ingest → Glue Trigger
+                ├── Download: adamamer2001/yelp-complete-open-dataset-2024
+                ├── Filter:   exclude photos/ images, keep photos.json
+                ├── Upload:   → s3://yelp-bronze-raw-us-east-1/
+                └── Trigger:  Glue Workflow → Crawler → bronze_to_silver job
+                                                              │
+                                                              ▼
+                                              s3://yelp-silver-clean-us-east-1/
+                                                ├── business/
+                                                ├── review/
+                                                ├── user/
+                                                ├── tip/
+                                                └── checkin/
 ```
 
----
+## AWS Services Used
 
-## Architectural Principles & Highlights
+| Service | Purpose |
+|---|---|
+| GitHub Actions | CI/CD — triggers on push to main |
+| HCP Terraform | Remote state management |
+| Terraform | Infrastructure as Code |
+| S3 (Bronze) | Raw Kaggle JSON storage |
+| S3 (Silver) | Cleaned Parquet output from Glue |
+| Glue Catalog DB | Metadata catalog for Bronze tables |
+| Glue Crawler | Discovers Bronze JSON schema |
+| Glue Job | PySpark ETL: Bronze → Silver |
+| Glue Workflow | Orchestrates Crawler → Job sequence |
 
-1. **Separation of Concerns**:
-   - **Terraform** provisions all infrastructure declaratively.
-   - **GitHub Actions** automates CI/CD and data ingestion execution.
-   - **AWS Glue** handles heavy distributed PySpark transformations.
-   - **Athena & Power BI** serve query traffic and business insights.
+## Planned Future Phases
 
-2. **Data Lake Medallion Architecture**:
-   - **Bronze**: Raw JSON dataset files ingested directly from Kaggle.
-   - **Silver**: Cleaned, schema-enforced, partitioned Parquet tables.
-   - **Gold**: Business-level aggregated KPI metrics optimized for BI queries.
-
-3. **AWS Academy Compatibility**:
-   - Designed to work smoothly under AWS Academy Learner Lab constraints (customizable `var.glue_service_role_arn` to inherit `LabRole`).
-   - On-demand lifecycle automation with `terraform-destroy.yml` to prevent unwanted cost accumulation.
+- **Phase 3**: Silver → Gold (aggregated KPIs)
+- **Phase 4**: Athena + Power BI dashboard

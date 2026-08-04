@@ -1,6 +1,11 @@
-variable "bucket_name" {
+variable "bronze_bucket_name" {
   type        = string
-  description = "Name of the S3 bucket"
+  description = "Name of the S3 Bronze (raw) bucket"
+}
+
+variable "silver_bucket_name" {
+  type        = string
+  description = "Name of the S3 Silver (cleaned) bucket"
 }
 
 variable "project_name" {

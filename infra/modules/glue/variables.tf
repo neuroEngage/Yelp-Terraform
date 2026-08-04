@@ -8,18 +8,28 @@ variable "environment" {
   description = "Deployment environment"
 }
 
-variable "bucket_id" {
+variable "bronze_bucket_id" {
   type        = string
-  description = "S3 Data Lake Bucket ID"
+  description = "Bronze S3 Bucket ID (scripts location + source data)"
 }
 
-variable "bucket_arn" {
+variable "bronze_bucket_arn" {
   type        = string
-  description = "S3 Data Lake Bucket ARN"
+  description = "Bronze S3 Bucket ARN"
+}
+
+variable "silver_bucket_id" {
+  type        = string
+  description = "Silver S3 Bucket ID (output from Glue ETL)"
+}
+
+variable "silver_bucket_arn" {
+  type        = string
+  description = "Silver S3 Bucket ARN"
 }
 
 variable "glue_service_role_arn" {
   type        = string
-  description = "Custom Glue IAM Role ARN if provided (for AWS Academy)"
+  description = "IAM Role ARN for Glue (LabRole for AWS Academy)"
   default     = ""
 }
