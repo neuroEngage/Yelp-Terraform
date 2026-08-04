@@ -131,6 +131,18 @@ def write_gold(tag, df, root, subpath, partition_by=None, num_output_files=None)
 # =======================================================================
 
 def read_silver_table(spark, dataset_name):
+    """
+    Read a Silver Parquet dataset from S3.
+
+    Uses mergeSchema=True so that if successive bronze_to_silver runs produced
+    slightly different column sets (e.g. new attribute columns), Spark unions
+    all schemas and fills missing columns with null instead of erroring out.
+
+    Tries three candidate prefix layouts in order:
+      1. silver/<dataset>/     ← written by bronze_to_silver (most common)
+      2. silver_layer/<dataset>/ ← alternate prefix seen in some runs
+      3. <dataset>/             ← root of the bucket
+    """
     paths_to_try = [
         f"s3://{SILVER_BUCKET}/silver/{dataset_name}",
         f"s3://{SILVER_BUCKET}/silver_layer/{dataset_name}",
@@ -139,13 +151,20 @@ def read_silver_table(spark, dataset_name):
     for path in paths_to_try:
         try:
             log("READ", f"Attempting to read '{dataset_name}' from {path}")
-            df = spark.read.parquet(path)
+            df = (
+                spark.read
+                     .option("mergeSchema", "true")
+                     .parquet(path)
+            )
             log("READ", f"Successfully read '{dataset_name}' from {path}")
             return df
         except Exception as e:
             log("READ_WARN", f"Could not read from {path}: {e}")
             continue
-    raise RuntimeError(f"Failed to read silver dataset '{dataset_name}' from all candidate paths: {paths_to_try}")
+    raise RuntimeError(
+        f"Failed to read silver dataset '{dataset_name}' from all candidate paths: {paths_to_try}"
+    )
+
 
 
 def read_all_silver_shared():
@@ -432,6 +451,44 @@ def run_ml_and_rag(business_clean, review_clean, user_clean):
 
 
 # =======================================================================
+# Checkin date explosion helper
+# =======================================================================
+
+def explode_checkin(checkin_df):
+    """
+    The raw Yelp checkin record stores ALL check-in timestamps for a business
+    in a single comma-separated string:
+
+        {"business_id": "abc", "date": "2016-04-26 19:49:16, 2016-08-30 18:36:57"}
+
+    bronze_to_silver writes this as-is (one row per business, date = string).
+    If we try to do F.col("date").cast(DateType()) on that string we get NULL
+    for every row, making fact_checkin_day / fact_checkin_hour completely empty.
+
+    This function splits the comma-separated string and explodes it so each
+    individual timestamp becomes its own row, then casts to TimestampType so
+    downstream date/hour/dayofweek functions work correctly.
+    """
+    log("CHECKIN", "Exploding comma-separated checkin dates into individual rows...")
+    exploded = (
+        checkin_df
+        .withColumn(
+            "checkin_ts",
+            F.explode(F.split(F.col("date"), ",\\s*"))
+        )
+        .withColumn(
+            "checkin_ts",
+            F.to_timestamp(F.trim(F.col("checkin_ts")), "yyyy-MM-dd HH:mm:ss")
+        )
+        .filter(F.col("checkin_ts").isNotNull())
+        .drop("date")
+        .withColumnRenamed("checkin_ts", "date")
+    )
+    log("CHECKIN", "Checkin date explosion complete.")
+    return exploded
+
+
+# =======================================================================
 # BI branch (star schema)
 # =======================================================================
 
@@ -479,9 +536,14 @@ def build_dim_business_hours(business_df):
 def run_bi(business_df, review_df, user_df, checkin_df):
     logger.info("\n[BI] Building star schema...")
 
+    # Fix: Yelp checkin stores all timestamps as one comma-separated string per
+    # business row. Explode into individual rows so cast(DateType) / hour() / etc.
+    # produce real values instead of NULLs.
+    checkin_exploded = explode_checkin(checkin_df).cache()
+
     # ---- dim_date ----
-    review_dates = review_df.select(F.col("date")).distinct()
-    checkin_dates = checkin_df.select(F.col("date")).distinct()
+    review_dates  = review_df.select(F.col("date")).distinct()
+    checkin_dates = checkin_exploded.select(F.col("date")).distinct()
     all_dates = review_dates.union(checkin_dates).distinct().filter(F.col("date").isNotNull())
 
     dim_date = all_dates.select(F.col("date").cast(DateType()).alias("Date")).distinct().select(
@@ -512,7 +574,7 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.round(F.avg(F.col("useful") + F.col("funny") + F.col("cool")), 2).alias("AvgReviewEngagement"),
         F.round(F.avg(F.length("text")), 2).alias("AvgReviewLength"),
     )
-    checkin_metrics = checkin_df.groupBy("business_id").agg(F.count("*").alias("CheckinCount"))
+    checkin_metrics = checkin_exploded.groupBy("business_id").agg(F.count("*").alias("CheckinCount"))
 
     fact_business = (
         business_df.select("business_id").distinct()
@@ -565,8 +627,8 @@ def run_bi(business_df, review_df, user_df, checkin_df):
     # ---- dim_business_hours ----
     dim_business_hours = build_dim_business_hours(business_df)
 
-    # ---- fact_checkin_day ----
-    fact_checkin_day = checkin_df.select(
+    # ---- fact_checkin_day (uses exploded timestamps) ----
+    fact_checkin_day = checkin_exploded.select(
         F.col("business_id").alias("BusinessID"),
         F.col("date").cast(DateType()).alias("CheckinDate"),
         F.dayofweek(F.col("date")).alias("DayOfWeek"),
@@ -575,8 +637,8 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.count("*").alias("CheckinCount")
     )
 
-    # ---- fact_checkin_hour ----
-    fact_checkin_hour = checkin_df.select(
+    # ---- fact_checkin_hour (uses exploded timestamps) ----
+    fact_checkin_hour = checkin_exploded.select(
         F.col("business_id").alias("BusinessID"),
         F.col("date").cast(DateType()).alias("CheckinDate"),
         F.hour(F.col("date")).alias("HourOfDay"),
@@ -595,6 +657,7 @@ def run_bi(business_df, review_df, user_df, checkin_df):
     dim_business_hours.coalesce(5).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_business_hours/")
     fact_checkin_day.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_checkin_day/")
     fact_checkin_hour.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_checkin_hour/")
+    checkin_exploded.unpersist()
     logger.info("[BI] All BI gold tables written.")
 
     return business_df, review_df, user_df

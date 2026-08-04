@@ -15,9 +15,15 @@ BRONZE_TO_SILVER_JOB    = "yelp-bigdata_bronze_to_silver"
 SILVER_CRAWLER_NAME     = "yelp-bigdata_silver_crawler"
 SILVER_TO_GOLD_JOB_NAME = "yelp-bigdata_silver_to_gold"
 GOLD_CRAWLER_NAME       = "yelp-bigdata_gold_crawler"
+GLUE_WORKFLOW_NAME      = "yelp-bigdata_etl_workflow"
 SILVER_BUCKET_NAME      = "yelp-silver-clean-us-east-1"
 GOLD_BUCKET_NAME        = "yelp-gold-analytics-us-east-1"
 
+# All 4 datasets that bronze_to_silver must write before silver_to_gold can start
+REQUIRED_SILVER_DATASETS = ["business", "review", "user", "checkin"]
+
+
+# ── Glue Job helper ──────────────────────────────────────────────────────────
 
 def start_and_wait_glue_job(glue, job_name):
     logger.info(f"Starting Glue Job: '{job_name}' ...")
@@ -48,6 +54,8 @@ def start_and_wait_glue_job(glue, job_name):
         time.sleep(20)
 
 
+# ── Glue Crawler helper ──────────────────────────────────────────────────────
+
 def start_and_wait_crawler(glue, crawler_name):
     """Start a Glue Crawler and wait until it finishes (READY state)."""
     logger.info(f"Starting Glue Crawler: '{crawler_name}' ...")
@@ -61,7 +69,6 @@ def start_and_wait_crawler(glue, crawler_name):
             logger.error(f"Failed to start crawler '{crawler_name}': {e}")
             return False
 
-    # Give the crawler a moment to start before polling
     time.sleep(10)
     while True:
         try:
@@ -73,7 +80,7 @@ def start_and_wait_crawler(glue, crawler_name):
 
             if state == "READY":
                 if last_status == "FAILED":
-                    logger.error(f"❌ Crawler '{crawler_name}' finished but last crawl FAILED: {last_crawl.get('ErrorMessage', 'Unknown')}")
+                    logger.error(f"❌ Crawler '{crawler_name}' last crawl FAILED: {last_crawl.get('ErrorMessage', 'Unknown')}")
                     sys.exit(1)
                 logger.info(f"✅ Crawler '{crawler_name}' finished successfully.")
                 return True
@@ -83,26 +90,85 @@ def start_and_wait_crawler(glue, crawler_name):
         time.sleep(15)
 
 
-def check_silver_ready(s3, silver_bucket):
+# ── Glue Workflow wait helper ─────────────────────────────────────────────────
+
+def wait_for_glue_workflow(glue, workflow_name, timeout_minutes=90):
     """
-    Ensures Silver Parquet tables exist in S3 before running Silver-to-Gold job.
-    Checks both /silver/ and /silver_layer/ prefixes to handle alternate layouts.
+    Poll the Glue Workflow until it reaches a terminal state.
+    This prevents trigger_gold.py from starting silver_to_gold while
+    the Workflow's bronze_to_silver is still actively overwriting Silver files.
     """
-    prefixes_to_check = ["silver/", "silver_layer/"]
-    logger.info(f"Checking Silver Parquet tables in s3://{silver_bucket}/ ...")
-    for prefix in prefixes_to_check:
+    logger.info(f"Checking Glue Workflow '{workflow_name}' for any active runs ...")
+    deadline = time.time() + timeout_minutes * 60
+
+    while time.time() < deadline:
         try:
-            resp = s3.list_objects_v2(Bucket=silver_bucket, Prefix=prefix, MaxKeys=10)
-            contents = resp.get("Contents", [])
-            if len(contents) > 0:
-                logger.info(f"✅ Silver data found under s3://{silver_bucket}/{prefix} ({len(contents)}+ objects).")
+            runs_resp = glue.get_workflow_runs(Name=workflow_name, MaxResults=1)
+            runs = runs_resp.get("Runs", [])
+            if not runs:
+                logger.info(f"No active Glue Workflow runs found for '{workflow_name}'. Proceeding.")
                 return True
+
+            latest_run = runs[0]
+            run_id = latest_run["WorkflowRunId"]
+            status  = latest_run["Status"]
+            logger.info(f"  Workflow '{workflow_name}' run '{run_id}' Status: {status}")
+
+            if status in ("COMPLETED", "STOPPED", "ERROR"):
+                logger.info(f"✅ Glue Workflow '{workflow_name}' run finished with status: {status}")
+                return True
+            elif status == "RUNNING":
+                logger.info(f"  Workflow still RUNNING — waiting 30s before re-check ...")
+            else:
+                logger.info(f"  Workflow status: {status} — waiting ...")
         except Exception as e:
-            logger.warning(f"Could not check s3://{silver_bucket}/{prefix}: {e}")
+            logger.warning(f"Error checking Glue Workflow status: {e}")
 
-    logger.warning(f"⚠️  No Silver data found in s3://{silver_bucket} under any known prefix.")
-    return False
+        time.sleep(30)
 
+    logger.error(f"❌ Timed out ({timeout_minutes}min) waiting for Glue Workflow '{workflow_name}' to complete.")
+    sys.exit(1)
+
+
+# ── Silver readiness check ────────────────────────────────────────────────────
+
+def check_silver_all_datasets(s3, silver_bucket):
+    """
+    Verify that ALL required Silver datasets were written by bronze_to_silver.
+    Checks that each dataset folder (business, review, user, checkin) has
+    at least one .parquet file — a single object is NOT enough.
+
+    Root cause note: The old check_silver_ready() returned True with just 1
+    object anywhere in silver/, which meant stale files from a previous run
+    would pass even if the current bronze_to_silver hadn't finished writing.
+    This caused silver_to_gold to start concurrently with bronze_to_silver,
+    which was actively overwriting those files with mode("overwrite") — leading
+    to "No such file or directory" errors on Spark task execution.
+    """
+    logger.info(f"Verifying all Silver datasets in s3://{silver_bucket}/silver/ ...")
+    all_ready = True
+
+    for dataset in REQUIRED_SILVER_DATASETS:
+        prefix = f"silver/{dataset}/"
+        try:
+            resp = s3.list_objects_v2(Bucket=silver_bucket, Prefix=prefix, MaxKeys=5)
+            parquet_files = [
+                obj for obj in resp.get("Contents", [])
+                if obj["Key"].endswith(".parquet") or obj["Key"].endswith(".snappy.parquet")
+            ]
+            if parquet_files:
+                logger.info(f"  ✅ {dataset}: {len(parquet_files)}+ parquet files found under {prefix}")
+            else:
+                logger.warning(f"  ⚠️  {dataset}: No parquet files found under {prefix}")
+                all_ready = False
+        except Exception as e:
+            logger.warning(f"  ⚠️  Could not check {prefix}: {e}")
+            all_ready = False
+
+    return all_ready
+
+
+# ── Gold verification ─────────────────────────────────────────────────────────
 
 def verify_gold_s3_data(s3, bucket_name):
     logger.info(f"Verifying Gold Parquet objects in s3://{bucket_name}/gold/ ...")
@@ -122,45 +188,63 @@ def verify_gold_s3_data(s3, bucket_name):
         sys.exit(1)
 
 
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
     glue = boto3.client("glue", region_name=REGION)
     s3   = boto3.client("s3",   region_name=REGION)
 
-    # Allow overriding job/crawler/bucket names via CLI args (used by GitHub Actions)
+    # Allow overriding names via CLI args (used by GitHub Actions)
     gold_job_name       = sys.argv[1] if len(sys.argv) > 1 else SILVER_TO_GOLD_JOB_NAME
     gold_crawler_name   = sys.argv[2] if len(sys.argv) > 2 else GOLD_CRAWLER_NAME
     gold_bucket         = sys.argv[3] if len(sys.argv) > 3 else GOLD_BUCKET_NAME
     silver_crawler_name = sys.argv[4] if len(sys.argv) > 4 else SILVER_CRAWLER_NAME
+    workflow_name       = sys.argv[5] if len(sys.argv) > 5 else GLUE_WORKFLOW_NAME
 
-    # ── Step 1: Ensure Bronze-to-Silver has run and Silver data exists ────────
-    if not check_silver_ready(s3, SILVER_BUCKET_NAME):
-        logger.info("Silver layer empty/missing. Running bronze_to_silver Glue job first...")
+    # ── Step 1: Wait for Glue Workflow to finish (CRITICAL) ──────────────────
+    # ingest.py fires the Glue Workflow and does NOT wait for it to finish.
+    # If we don't wait here, bronze_to_silver may still be writing Silver files
+    # with mode("overwrite") while silver_to_gold tries to read them — causing
+    # "No such file or directory" errors on specific Parquet part files.
+    logger.info("=" * 65)
+    logger.info("STEP 1: Waiting for Glue Workflow to complete (if running)...")
+    logger.info("=" * 65)
+    wait_for_glue_workflow(glue, workflow_name)
+
+    # ── Step 2: Verify all 4 Silver datasets are fully written ───────────────
+    logger.info("=" * 65)
+    logger.info("STEP 2: Verifying all Silver datasets are present ...")
+    logger.info("=" * 65)
+    if not check_silver_all_datasets(s3, SILVER_BUCKET_NAME):
+        logger.info("Silver layer incomplete. Running bronze_to_silver Glue job...")
         start_and_wait_glue_job(glue, BRONZE_TO_SILVER_JOB)
+        # Re-check after job completes
+        if not check_silver_all_datasets(s3, SILVER_BUCKET_NAME):
+            logger.error("❌ Silver datasets still missing after bronze_to_silver. Aborting.")
+            sys.exit(1)
 
-    # ── Step 2: Run Silver Crawler → catalog fresh Silver schema ─────────────
-    # This MUST happen before silver_to_gold so Spark reads the up-to-date schema
-    # and does not hit "No such file or directory" errors from stale catalog paths.
-    logger.info("=" * 60)
-    logger.info("STEP 2: Running Silver Crawler to catalog latest Silver schema...")
-    logger.info("=" * 60)
+    # ── Step 3: Run Silver Crawler → catalog fresh Silver schema ─────────────
+    logger.info("=" * 65)
+    logger.info("STEP 3: Running Silver Crawler to catalog latest Silver schema...")
+    logger.info("=" * 65)
     start_and_wait_crawler(glue, silver_crawler_name)
 
-    # ── Step 3: Run Silver → Gold job ────────────────────────────────────────
-    logger.info("=" * 60)
-    logger.info("STEP 3: Running Silver-to-Gold Glue Job (BI + ML + RAG)...")
-    logger.info("=" * 60)
+    # ── Step 4: Run Silver → Gold job ────────────────────────────────────────
+    logger.info("=" * 65)
+    logger.info("STEP 4: Running Silver-to-Gold Glue Job (BI + ML + RAG)...")
+    logger.info("=" * 65)
     start_and_wait_glue_job(glue, gold_job_name)
 
-    # ── Step 4: Run Gold Crawler → catalog Gold tables into yelp_db_gold ─────
-    logger.info("=" * 60)
-    logger.info("STEP 4: Running Gold Crawler to catalog Gold schema...")
-    logger.info("=" * 60)
+    # ── Step 5: Run Gold Crawler → catalog Gold tables ───────────────────────
+    logger.info("=" * 65)
+    logger.info("STEP 5: Running Gold Crawler to catalog Gold schema...")
+    logger.info("=" * 65)
     start_and_wait_crawler(glue, gold_crawler_name)
 
-    # ── Step 5: Verify Parquet files landed in Gold S3 bucket ────────────────
-    logger.info("=" * 60)
-    logger.info("STEP 5: Verifying Gold S3 output...")
-    logger.info("=" * 60)
+    # ── Step 6: Verify Gold S3 output ────────────────────────────────────────
+    logger.info("=" * 65)
+    logger.info("STEP 6: Verifying Gold S3 output...")
+    logger.info("=" * 65)
     verify_gold_s3_data(s3, gold_bucket)
 
     logger.info("🏆 Full Silver → Gold pipeline completed successfully!")
