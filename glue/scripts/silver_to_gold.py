@@ -126,16 +126,34 @@ def write_gold(tag, df, root, subpath, partition_by=None, num_output_files=None)
 # Stage 0 — Read Silver ONCE, shared by BI branch and ML+RAG branch
 # =======================================================================
 
+def read_silver_table(spark, dataset_name):
+    path = f"{SILVER_PATH}/{dataset_name}/"
+    log("READ", f"Reading Silver dataset from: {path}")
+    try:
+        df = spark.read.parquet(path)
+        log("READ", f"Successfully read '{dataset_name}' from {path}")
+        return df
+    except Exception as e:
+        alt_path = f"s3://{SILVER_BUCKET}/{dataset_name}/"
+        log("READ_WARN", f"Path {path} not found. Trying fallback path: {alt_path}")
+        try:
+            df = spark.read.parquet(alt_path)
+            log("READ", f"Successfully read '{dataset_name}' from fallback {alt_path}")
+            return df
+        except Exception as e2:
+            log("READ_ERROR", f"Failed to read '{dataset_name}' from both {path} and {alt_path}: {e2}")
+            raise e2
+
 def read_all_silver_shared():
-    business_df = spark.read.parquet(f"{SILVER_PATH}/business/")
-    review_df = spark.read.parquet(f"{SILVER_PATH}/review/")
-    user_df = spark.read.parquet(f"{SILVER_PATH}/user/")
-    checkin_df = spark.read.parquet(f"{SILVER_PATH}/checkin/")
+    business_df = read_silver_table(spark, "business")
+    review_df   = read_silver_table(spark, "review")
+    user_df     = read_silver_table(spark, "user")
+    checkin_df  = read_silver_table(spark, "checkin")
 
     business_df = business_df.cache()
-    review_df = review_df.cache()
-    user_df = user_df.cache()
-    checkin_df = checkin_df.cache()
+    review_df   = review_df.cache()
+    user_df     = user_df.cache()
+    checkin_df  = checkin_df.cache()
     return business_df, review_df, user_df, checkin_df
 
 
