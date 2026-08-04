@@ -128,3 +128,41 @@ jobs:
           GLUE_WORKFLOW_NAME: ${{ needs.terraform.outputs.glue_workflow }}
           TRIGGER_GLUE:       "true"
         run: python ingestion/ingest.py
+
+  # ────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Gold ETL: Trigger Silver-to-Gold PySpark Job & verify Gold S3
+  # Runs after Ingest job succeeds
+  # ────────────────────────────────────────────────────────────────────────
+  gold_etl:
+    name: "3 · Silver to Gold ETL → Gold S3 Verification"
+    runs-on: ubuntu-latest
+    needs: [terraform, ingest]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: pip install -r ingestion/requirements.txt
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            us-east-1
+
+      - name: Trigger & Monitor Silver to Gold Glue Job
+        run: |
+          python ingestion/trigger_gold.py \
+            "yelp-bigdata_silver_to_gold" \
+            "yelp-bigdata_gold_crawler" \
+            "yelp-gold-analytics-us-east-1"
+
