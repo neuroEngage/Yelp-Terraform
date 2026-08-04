@@ -4,20 +4,29 @@ OPTIMIZED — FINAL MERGED ETL GLUE JOB SCRIPT - Silver to Gold Layer Transforma
 (BI star-schema branch + ML feature-engineering branch + RAG document branch)
 ================================================================================
 Purpose : Transform Yelp data from Silver Layer to Gold Layer
-Source  : s3://<SILVER_BUCKET>/silver/ (or /silver_layer/)
-Target  : s3://<GOLD_BUCKET>/gold/
+Source  : s3://yelpdatasetvita/silver_layer (Parquet, Snappy)
+Target  : s3://final-scripts-merged-silver-and-merged-gold/gold_layer
              ├── bi/    (Star-schema BI tables)
              ├── ml/    (ML feature tables)
              └── rag/   (RAG documents)
 
-WHAT CHANGED VS THE ORIGINAL (performance & dynamic S3 bucket parameterization):
-  1. Business/review/user/checkin are read from Silver ONCE and cached, then
-     shared by BOTH the BI branch and the ML+RAG branch.
-  2. All redundant "count-just-to-log" calls removed to eliminate unnecessary full S3 scans.
-  3. dim_business_hours uses pure Spark stack() explosion — no driver-side collect().
-  4. Removed unnecessary global orderBy() before writes for Parquet outputs.
-  5. repartition(N) -> coalesce(N) for aggregated output tables.
-  6. Dynamic resolution of S3 input/output paths via Glue job parameters (SILVER_BUCKET, GOLD_BUCKET).
+WHAT CHANGED VS THE ORIGINAL (performance only — no output schema/column/value changes):
+  1. business/review/user/checkin are read from Silver ONCE and cached, then
+     shared by BOTH the BI branch and the ML+RAG branch (original read them twice).
+  2. All "count-just-to-log" calls removed. Every .count() is a full Spark
+     action — with nothing cached, each one silently re-executed the whole
+     DAG from S3 again. This was the single biggest hidden cost.
+  3. dim_business_hours no longer does .collect() + a driver-side Python for
+     loop (this pulled every business row to the driver, single-threaded).
+     Rewritten as a pure Spark `stack()` + explode-style transformation, so it
+     runs distributed like everything else.
+  4. Removed .orderBy() before writes (dim_date, fact_review_trend,
+     fact_rating_distribution, fact_checkin_day/hour) — global sort = full
+     shuffle, and Parquet/Athena don't need row order.
+  5. repartition(N) -> coalesce(N) for already-aggregated (small) output
+     tables, since coalesce avoids a shuffle when reducing partition count.
+  6. AQE tuning: coalescePartitions + skewJoin enabled, shuffle partitions
+     tuned down from Spark's default 200 (too many for tables this size).
 ================================================================================
 """
 
@@ -40,9 +49,9 @@ from pyspark.sql.types import *
 import pyspark.sql.functions as F
 
 # ================================================================================
-# SETUP & RESOLVE GLUE ARGUMENTS
+# SETUP
 # ================================================================================
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "SILVER_BUCKET", "GOLD_BUCKET"])
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -63,18 +72,15 @@ logger.setLevel(logging.INFO)
 # ================================================================================
 # CONFIGURATION
 # ================================================================================
-SILVER_BUCKET = args["SILVER_BUCKET"]
-GOLD_BUCKET   = args["GOLD_BUCKET"]
+SILVER_PATH = "s3://yelpdatasetvita/silver_layer"
 
-GOLD_ROOT = f"s3://{GOLD_BUCKET}/gold"
-GOLD_PATH_BI  = f"{GOLD_ROOT}/bi"
-GOLD_PATH_ML  = f"{GOLD_ROOT}/ml"
+GOLD_ROOT = "s3://final-scripts-merged-silver-and-merged-gold/gold_layer"
+GOLD_PATH_BI = f"{GOLD_ROOT}/bi"
+GOLD_PATH_ML = f"{GOLD_ROOT}/ml"
 GOLD_PATH_RAG = f"{GOLD_ROOT}/rag"
 
 logger.info("=" * 80)
 logger.info("GLUE ETL JOB (OPTIMIZED): Silver to Gold Layer Transformation (BI + ML + RAG)")
-logger.info(f"Silver Bucket: {SILVER_BUCKET}")
-logger.info(f"Gold Root    : {GOLD_ROOT}")
 logger.info("=" * 80)
 
 LOG1P_10000 = math.log1p(10000)
@@ -107,14 +113,8 @@ def safe_attribute_column(df, attribute_key, alias, default=None):
     return lit(default).alias(alias)
 
 
-def safe_col(df, col_name, default=None):
-    if col_name in df.columns:
-        return col(col_name)
-    return lit(default)
-
-
 def write_gold(tag, df, root, subpath, partition_by=None, num_output_files=None):
-    """Writes a gold table."""
+    """Writes a gold table. No pre-write .count() (that was a redundant full pass)."""
     output_path = f"{root}/{subpath}/"
     if num_output_files:
         df = df.coalesce(num_output_files)
@@ -130,39 +130,23 @@ def write_gold(tag, df, root, subpath, partition_by=None, num_output_files=None)
 # Stage 0 — Read Silver ONCE, shared by BI branch and ML+RAG branch
 # =======================================================================
 
-def read_silver_table(spark, dataset_name):
-    paths_to_try = [
-        f"s3://{SILVER_BUCKET}/silver/{dataset_name}",
-        f"s3://{SILVER_BUCKET}/silver_layer/{dataset_name}",
-        f"s3://{SILVER_BUCKET}/{dataset_name}",
-    ]
-    for path in paths_to_try:
-        try:
-            log("READ", f"Attempting to read '{dataset_name}' from {path}")
-            df = spark.read.parquet(path)
-            log("READ", f"Successfully read '{dataset_name}' from {path}")
-            return df
-        except Exception as e:
-            log("READ_WARN", f"Could not read from {path}: {e}")
-            continue
-    raise RuntimeError(f"Failed to read silver dataset '{dataset_name}' from all candidate paths: {paths_to_try}")
-
-
 def read_all_silver_shared():
-    business_df = read_silver_table(spark, "business")
-    review_df   = read_silver_table(spark, "review")
-    user_df     = read_silver_table(spark, "user")
-    checkin_df  = read_silver_table(spark, "checkin")
+    business_df = spark.read.parquet(f"{SILVER_PATH}/business/")
+    review_df = spark.read.parquet(f"{SILVER_PATH}/review/")
+    user_df = spark.read.parquet(f"{SILVER_PATH}/user/")
+    checkin_df = spark.read.parquet(f"{SILVER_PATH}/checkin/")
 
+    # Cache once — reused by BI, ML, and RAG branches below. No .count() here;
+    # caching is lazy and will materialize on first real action naturally.
     business_df = business_df.cache()
-    review_df   = review_df.cache()
-    user_df     = user_df.cache()
-    checkin_df  = checkin_df.cache()
+    review_df = review_df.cache()
+    user_df = user_df.cache()
+    checkin_df = checkin_df.cache()
     return business_df, review_df, user_df, checkin_df
 
 
 # =======================================================================
-# Stage — Defensive cleaning
+# Stage — Defensive cleaning (single count at the end only, not before/after)
 # =======================================================================
 
 def clean_business(business_df):
@@ -182,7 +166,7 @@ def clean_user(user_df):
 
 
 # =======================================================================
-# ML branch — prepare / master join / features
+# ML branch — prepare / master join / features (logic unchanged)
 # =======================================================================
 
 def prepare_business(business_df):
@@ -316,7 +300,7 @@ def build_customer_segmentation(features_df, user_prepared):
 
 
 # =======================================================================
-# RAG branch
+# RAG branch (logic unchanged)
 # =======================================================================
 
 def transform_business_documents(biz_df):
@@ -325,24 +309,24 @@ def transform_business_documents(biz_df):
 
     hours_concat = F.concat_ws(
         " | ",
-        F.when(safe_col(biz_df, "hours_monday").isNotNull(), F.concat(F.lit("Monday: "), safe_col(biz_df, "hours_monday"))),
-        F.when(safe_col(biz_df, "hours_tuesday").isNotNull(), F.concat(F.lit("Tuesday: "), safe_col(biz_df, "hours_tuesday"))),
-        F.when(safe_col(biz_df, "hours_wednesday").isNotNull(), F.concat(F.lit("Wednesday: "), safe_col(biz_df, "hours_wednesday"))),
-        F.when(safe_col(biz_df, "hours_thursday").isNotNull(), F.concat(F.lit("Thursday: "), safe_col(biz_df, "hours_thursday"))),
-        F.when(safe_col(biz_df, "hours_friday").isNotNull(), F.concat(F.lit("Friday: "), safe_col(biz_df, "hours_friday"))),
-        F.when(safe_col(biz_df, "hours_saturday").isNotNull(), F.concat(F.lit("Saturday: "), safe_col(biz_df, "hours_saturday"))),
-        F.when(safe_col(biz_df, "hours_sunday").isNotNull(), F.concat(F.lit("Sunday: "), safe_col(biz_df, "hours_sunday")))
+        F.when(F.col("hours_monday").isNotNull(), F.concat(F.lit("Monday: "), F.col("hours_monday"))),
+        F.when(F.col("hours_tuesday").isNotNull(), F.concat(F.lit("Tuesday: "), F.col("hours_tuesday"))),
+        F.when(F.col("hours_wednesday").isNotNull(), F.concat(F.lit("Wednesday: "), F.col("hours_wednesday"))),
+        F.when(F.col("hours_thursday").isNotNull(), F.concat(F.lit("Thursday: "), F.col("hours_thursday"))),
+        F.when(F.col("hours_friday").isNotNull(), F.concat(F.lit("Friday: "), F.col("hours_friday"))),
+        F.when(F.col("hours_saturday").isNotNull(), F.concat(F.lit("Saturday: "), F.col("hours_saturday"))),
+        F.when(F.col("hours_sunday").isNotNull(), F.concat(F.lit("Sunday: "), F.col("hours_sunday")))
     )
 
     features_concat = F.concat_ws(
         ", ",
-        F.when(safe_col(biz_df, "attributes_businessacceptscreditcards").isNotNull(), F.concat(F.lit("creditcards="), safe_col(biz_df, "attributes_businessacceptscreditcards"))),
-        F.when(safe_col(biz_df, "attributes_businessparking").isNotNull(), F.concat(F.lit("parking="), safe_col(biz_df, "attributes_businessparking"))),
-        F.when(safe_col(biz_df, "attributes_restaurantspricerange2").isNotNull(), F.concat(F.lit("pricerange="), safe_col(biz_df, "attributes_restaurantspricerange2"))),
-        F.when(safe_col(biz_df, "attributes_restaurantsdelivery").isNotNull(), F.concat(F.lit("delivery="), safe_col(biz_df, "attributes_restaurantsdelivery"))),
-        F.when(safe_col(biz_df, "attributes_restaurantstakeout").isNotNull(), F.concat(F.lit("takeout="), safe_col(biz_df, "attributes_restaurantstakeout"))),
-        F.when(safe_col(biz_df, "attributes_outdoorseating").isNotNull(), F.concat(F.lit("outdoorseating="), safe_col(biz_df, "attributes_outdoorseating"))),
-        F.when(safe_col(biz_df, "attributes_wifi").isNotNull(), F.concat(F.lit("wifi="), safe_col(biz_df, "attributes_wifi")))
+        F.when(F.col("attributes_businessacceptscreditcards").isNotNull(), F.concat(F.lit("creditcards="), F.col("attributes_businessacceptscreditcards"))),
+        F.when(F.col("attributes_businessparking").isNotNull(), F.concat(F.lit("parking="), F.col("attributes_businessparking"))),
+        F.when(F.col("attributes_restaurantspricerange2").isNotNull(), F.concat(F.lit("pricerange="), F.col("attributes_restaurantspricerange2"))),
+        F.when(F.col("attributes_restaurantsdelivery").isNotNull(), F.concat(F.lit("delivery="), F.col("attributes_restaurantsdelivery"))),
+        F.when(F.col("attributes_restaurantstakeout").isNotNull(), F.concat(F.lit("takeout="), F.col("attributes_restaurantstakeout"))),
+        F.when(F.col("attributes_outdoorseating").isNotNull(), F.concat(F.lit("outdoorseating="), F.col("attributes_outdoorseating"))),
+        F.when(F.col("attributes_wifi").isNotNull(), F.concat(F.lit("wifi="), F.col("attributes_wifi")))
     )
 
     doc_text = F.concat(
@@ -352,7 +336,7 @@ def transform_business_documents(biz_df):
         F.lit("\nLocation: "), F.coalesce(F.col("address"), F.lit("")), F.lit(", "), F.coalesce(F.col("city"), F.lit("")), F.lit(", "), F.coalesce(F.col("state"), F.lit("")), F.lit(" "), F.coalesce(F.col("postal_code"), F.lit("")),
         F.lit("\nCoordinates: Lat "), F.coalesce(F.col("latitude").cast("string"), F.lit("N/A")), F.lit(", Lon "), F.coalesce(F.col("longitude").cast("string"), F.lit("N/A")),
         F.lit("\nRating: "), F.coalesce(F.col("stars").cast("string"), F.lit("N/A")), F.lit(" stars ("), F.coalesce(F.col("review_count").cast("string"), F.lit("0")), F.lit(" reviews)"),
-        F.lit("\nPrice Range: "), F.coalesce(safe_col(biz_df, "attributes_restaurantspricerange2"), F.lit("N/A")),
+        F.lit("\nPrice Range: "), F.coalesce(F.col("attributes_restaurantspricerange2"), F.lit("N/A")),
         F.lit("\nOperating Status: "), F.when(F.col("is_open") == 1, F.lit("Open")).otherwise(F.lit("Closed")),
         F.lit("\nHours: "), F.when(hours_concat != "", hours_concat).otherwise(F.lit("N/A")),
         F.lit("\nFeatures: "), F.when(features_concat != "", features_concat).otherwise(F.lit("N/A"))
@@ -364,7 +348,7 @@ def transform_business_documents(biz_df):
         F.col("state"), F.col("postal_code"), F.col("latitude").cast(DoubleType()), F.col("longitude").cast(DoubleType()),
         primary_cat.alias("primary_category"), categories_split.alias("category_list"),
         F.col("stars").cast(DoubleType()).alias("business_rating"), F.col("review_count").cast(LongType()),
-        safe_col(biz_df, "attributes_restaurantspricerange2").alias("price_range"), F.col("is_open").cast(IntegerType()),
+        F.col("attributes_restaurantspricerange2").alias("price_range"), F.col("is_open").cast(IntegerType()),
         hours_concat.alias("hours"), features_concat.alias("business_features"),
         doc_text.alias("document_text"), F.lit("business").alias("document_type"),
         F.current_timestamp().alias("last_updated")
@@ -432,7 +416,9 @@ def run_ml_and_rag(business_clean, review_clean, user_clean):
 
 
 # =======================================================================
-# BI branch (star schema)
+# BI branch (star schema) — same logic, no mid-pipeline counts, no
+# driver-side collect() for business hours, no pre-write orderBy(), and
+# repartition() -> coalesce() for already-aggregated tables.
 # =======================================================================
 
 def build_dim_business_hours(business_df):
@@ -494,7 +480,7 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.dayofweek(F.col("Date")).alias("DayOfWeek"),
         F.dayofmonth(F.col("Date")).alias("DayOfMonth"),
         F.weekofyear(F.col("Date")).alias("WeekOfYear"),
-    )
+    )  # orderBy removed — unnecessary shuffle for Parquet output
 
     # ---- dim_business ----
     dim_business = business_df.select(
@@ -555,14 +541,14 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.round(F.avg("Rating"), 2).alias("AvgRating"),
         F.min("Rating").alias("MinRating"),
         F.max("Rating").alias("MaxRating"),
-    )
+    )  # orderBy removed
 
     # ---- fact_rating_distribution ----
     fact_rating_distribution = review_df.select(
         F.col("business_id").alias("BusinessID"), F.col("stars").alias("RatingValue")
-    ).groupBy("BusinessID", "RatingValue").agg(F.count("*").alias("ReviewCount"))
+    ).groupBy("BusinessID", "RatingValue").agg(F.count("*").alias("ReviewCount"))  # orderBy removed
 
-    # ---- dim_business_hours ----
+    # ---- dim_business_hours (rewritten — no driver collect) ----
     dim_business_hours = build_dim_business_hours(business_df)
 
     # ---- fact_checkin_day ----
@@ -573,7 +559,7 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.date_format(F.col("date"), "yyyyMMdd").cast(LongType()).alias("DateKey"),
     ).groupBy("BusinessID", "DateKey", "CheckinDate", "DayOfWeek").agg(
         F.count("*").alias("CheckinCount")
-    )
+    )  # orderBy removed
 
     # ---- fact_checkin_hour ----
     fact_checkin_hour = checkin_df.select(
@@ -583,9 +569,9 @@ def run_bi(business_df, review_df, user_df, checkin_df):
         F.date_format(F.col("date"), "yyyyMMdd").cast(LongType()).alias("DateKey"),
     ).groupBy("BusinessID", "DateKey", "CheckinDate", "HourOfDay").agg(
         F.count("*").alias("CheckinCount")
-    )
+    )  # orderBy removed
 
-    # ---- write ----
+    # ---- write (coalesce instead of repartition — no shuffle needed here) ----
     logger.info("[BI] Writing gold tables...")
     dim_date.coalesce(1).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_date/")
     dim_business.coalesce(10).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_business/")
@@ -597,7 +583,7 @@ def run_bi(business_df, review_df, user_df, checkin_df):
     fact_checkin_hour.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_checkin_hour/")
     logger.info("[BI] All BI gold tables written.")
 
-    return business_df, review_df, user_df
+    return business_df, review_df, user_df  # returned for reuse by ML+RAG branch
 
 
 # =======================================================================
@@ -609,8 +595,8 @@ try:
 
     # Clean once, share cleaned frames across BI and ML+RAG
     business_clean = clean_business(business_df).cache()
-    review_clean   = clean_review(review_df).cache()
-    user_clean     = clean_user(user_df).cache()
+    review_clean = clean_review(review_df).cache()
+    user_clean = clean_user(user_df).cache()
 
     run_bi(business_clean, review_clean, user_clean, checkin_df)
     print("\nBI Gold dataset built successfully.")
