@@ -26,6 +26,11 @@ variable "silver_bucket_name" {
   description = "Name of the S3 Silver (cleaned) bucket"
 }
 
+variable "gold_bucket_name" {
+  type        = string
+  description = "Name of the S3 Gold (analytics BI/ML/RAG) bucket"
+}
+
 variable "glue_service_role_arn" {
   type        = string
   description = "IAM Role ARN for Glue (use LabRole for AWS Academy)"

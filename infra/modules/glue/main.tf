@@ -1,9 +1,14 @@
 # ─────────────────────────────────────────────
-# GLUE CATALOG DATABASE
+# GLUE CATALOG DATABASES
 # ─────────────────────────────────────────────
 resource "aws_glue_catalog_database" "yelp_db" {
   name        = "yelp_db"
   description = "Glue Catalog for Yelp Bronze JSON tables (crawled from S3)"
+}
+
+resource "aws_glue_catalog_database" "yelp_db_gold" {
+  name        = "yelp_db_gold"
+  description = "Glue Catalog for Yelp Gold analytics tables (BI + ML + RAG)"
 }
 
 # ─────────────────────────────────────────────
@@ -41,7 +46,8 @@ resource "aws_iam_role_policy" "glue_s3_policy" {
       Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
       Resource = [
         var.bronze_bucket_arn, "${var.bronze_bucket_arn}/*",
-        var.silver_bucket_arn, "${var.silver_bucket_arn}/*"
+        var.silver_bucket_arn, "${var.silver_bucket_arn}/*",
+        var.gold_bucket_arn, "${var.gold_bucket_arn}/*"
       ]
     }]
   })
@@ -52,18 +58,18 @@ locals {
 }
 
 # ─────────────────────────────────────────────
-# GLUE CRAWLER  (crawls bronze bucket → registers tables in yelp_db)
-# Must run BEFORE the ETL job on first deployment
+# GLUE CRAWLERS
 # ─────────────────────────────────────────────
+
+# Bronze Crawler: crawls raw JSON → registers in yelp_db
 resource "aws_glue_crawler" "bronze_crawler" {
   name          = "${var.project_name}_bronze_crawler"
   database_name = aws_glue_catalog_database.yelp_db.name
   role          = local.role_arn
-  description   = "Crawls raw JSON files in the Bronze S3 bucket"
+  description   = "Crawls raw JSON files in Bronze S3 bucket"
 
   s3_target {
-    path = "s3://${var.bronze_bucket_id}/"
-
+    path       = "s3://${var.bronze_bucket_id}/"
     exclusions = ["scripts/**"]
   }
 
@@ -75,16 +81,37 @@ resource "aws_glue_crawler" "bronze_crawler" {
   })
 }
 
+# Gold Crawler: crawls final Parquet → registers in yelp_db_gold
+resource "aws_glue_crawler" "gold_crawler" {
+  name          = "${var.project_name}_gold_crawler"
+  database_name = aws_glue_catalog_database.yelp_db_gold.name
+  role          = local.role_arn
+  description   = "Crawls Gold Parquet tables (BI, ML, RAG) in Gold S3 bucket"
+
+  s3_target {
+    path = "s3://${var.gold_bucket_id}/gold/"
+  }
+
+  configuration = jsonencode({
+    Version = 1.0
+    Grouping = {
+      TableGroupingPolicy = "CombineCompatibleSchemas"
+    }
+  })
+}
+
 # ─────────────────────────────────────────────
-# GLUE JOB  bronze → silver
+# GLUE JOBS
 # ─────────────────────────────────────────────
+
+# Job 1: Bronze → Silver ETL
 resource "aws_glue_job" "bronze_to_silver" {
-  name         = "${var.project_name}_bronze_to_silver"
-  role_arn     = local.role_arn
-  glue_version = "4.0"
-  worker_type  = "G.1X"
+  name              = "${var.project_name}_bronze_to_silver"
+  role_arn          = local.role_arn
+  glue_version      = "4.0"
+  worker_type       = "G.1X"
   number_of_workers = 2
-  timeout      = 120
+  timeout           = 120
 
   command {
     name            = "glueetl"
@@ -102,16 +129,45 @@ resource "aws_glue_job" "bronze_to_silver" {
   }
 }
 
+# Job 2: Silver → Gold ETL (BI + ML + RAG)
+resource "aws_glue_job" "silver_to_gold" {
+  name              = "${var.project_name}_silver_to_gold"
+  role_arn          = local.role_arn
+  glue_version      = "4.0"
+  worker_type       = "G.1X"
+  number_of_workers = 2
+  timeout           = 120
+
+  command {
+    name            = "glueetl"
+    script_location = "s3://${var.bronze_bucket_id}/scripts/silver_to_gold.py"
+    python_version  = "3"
+  }
+
+  default_arguments = {
+    "--job-language"                     = "python"
+    "--job-bookmark-option"              = "job-bookmark-disable"
+    "--enable-metrics"                   = "true"
+    "--enable-continuous-cloudwatch-log" = "true"
+    "--SILVER_BUCKET"                    = var.silver_bucket_id
+    "--GOLD_BUCKET"                      = var.gold_bucket_id
+  }
+}
+
 # ─────────────────────────────────────────────
 # GLUE WORKFLOW + TRIGGERS
-# Order: Crawler → bronze_to_silver job
+# Sequence:
+#   1. Bronze Crawler (crawls raw JSON → yelp_db)
+#   2. bronze_to_silver Job (writes Parquet → Silver S3)
+#   3. silver_to_gold Job (writes Parquet BI/ML/RAG → Gold S3)
+#   4. Gold Crawler (crawls Gold S3 → yelp_db_gold)
 # ─────────────────────────────────────────────
 resource "aws_glue_workflow" "etl_workflow" {
   name        = "${var.project_name}_etl_workflow"
-  description = "Yelp ETL: crawl bronze → run bronze_to_silver"
+  description = "Yelp Full Medallion ETL: Bronze Crawler → Bronze-to-Silver Job → Silver-to-Gold Job → Gold Crawler"
 }
 
-# Trigger 1: start crawler on demand (ingest.py calls start-workflow-run)
+# Trigger 1: start Bronze Crawler on demand (ingest.py calls start-workflow-run)
 resource "aws_glue_trigger" "start_crawler" {
   name          = "${var.project_name}_trigger_start_crawler"
   type          = "ON_DEMAND"
@@ -122,7 +178,7 @@ resource "aws_glue_trigger" "start_crawler" {
   }
 }
 
-# Trigger 2: after crawler succeeds → run bronze_to_silver job
+# Trigger 2: after Bronze Crawler succeeds → run bronze_to_silver job
 resource "aws_glue_trigger" "start_bronze_to_silver" {
   name          = "${var.project_name}_trigger_bronze_to_silver"
   type          = "CONDITIONAL"
@@ -137,5 +193,41 @@ resource "aws_glue_trigger" "start_bronze_to_silver" {
 
   actions {
     job_name = aws_glue_job.bronze_to_silver.name
+  }
+}
+
+# Trigger 3: after bronze_to_silver job succeeds → run silver_to_gold job
+resource "aws_glue_trigger" "start_silver_to_gold" {
+  name          = "${var.project_name}_trigger_silver_to_gold"
+  type          = "CONDITIONAL"
+  workflow_name = aws_glue_workflow.etl_workflow.name
+
+  predicate {
+    conditions {
+      job_name = aws_glue_job.bronze_to_silver.name
+      state    = "SUCCEEDED"
+    }
+  }
+
+  actions {
+    job_name = aws_glue_job.silver_to_gold.name
+  }
+}
+
+# Trigger 4: after silver_to_gold job succeeds → run Gold Crawler
+resource "aws_glue_trigger" "start_gold_crawler" {
+  name          = "${var.project_name}_trigger_gold_crawler"
+  type          = "CONDITIONAL"
+  workflow_name = aws_glue_workflow.etl_workflow.name
+
+  predicate {
+    conditions {
+      job_name = aws_glue_job.silver_to_gold.name
+      state    = "SUCCEEDED"
+    }
+  }
+
+  actions {
+    crawler_name = aws_glue_crawler.gold_crawler.name
   }
 }
