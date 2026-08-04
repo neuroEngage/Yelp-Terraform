@@ -1,0 +1,49 @@
+name: "3 · Silver to Gold ETL (BI + ML + RAG)"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Manual trigger button in GitHub Actions UI  OR  called from main pipeline
+# ──────────────────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      silver_bucket:
+        description: "Silver S3 Bucket Name"
+        required: false
+        default: "yelp-silver-clean-us-east-1"
+      gold_bucket:
+        description: "Gold S3 Bucket Name"
+        required: false
+        default: "yelp-gold-analytics-us-east-1"
+
+jobs:
+  silver_to_gold:
+    name: "Run Silver to Gold PySpark ETL Job"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: pip install -r ingestion/requirements.txt
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            us-east-1
+
+      - name: Trigger Silver to Gold Job & Monitor Execution
+        run: |
+          python ingestion/trigger_gold.py \
+            "yelp-bigdata_silver_to_gold" \
+            "yelp-bigdata_gold_crawler" \
+            "${{ github.event.inputs.gold_bucket || 'yelp-gold-analytics-us-east-1' }}"
