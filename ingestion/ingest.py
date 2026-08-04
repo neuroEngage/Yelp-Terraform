@@ -103,28 +103,25 @@ def download_dataset(username, key):
     os.makedirs(TEMP_DIR, exist_ok=True)
     log_disk()
 
-    logger.info(f"Attempting Kaggle CLI download for '{DATASET_NAME}' ...")
-    cmd = [
-        "kaggle", "datasets", "download",
-        "-d", DATASET_NAME,
-        "-p", TEMP_DIR,
-        "--force",
-    ]
-    logger.info(f"Executing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=False, text=True)
-
-    if result.returncode == 0:
-        logger.info("Kaggle CLI download completed successfully.")
-        log_disk()
-        return
-
-    logger.warning("Kaggle CLI download returned non-zero exit code. Switching to Direct HTTP REST API stream...")
+    logger.info(f"Downloading dataset '{DATASET_NAME}' via Direct Kaggle REST API stream ...")
     success = download_via_http_direct(username, key)
-    
-    if not success:
-        logger.error("❌ Both Kaggle CLI and Direct HTTP REST API download failed.")
-        sys.exit(1)
 
+    if not success:
+        logger.warning("Direct HTTP REST API stream failed. Attempting Kaggle CLI as fallback...")
+        cmd = [
+            "kaggle", "datasets", "download",
+            "-d", DATASET_NAME,
+            "-p", TEMP_DIR,
+            "--force",
+        ]
+        logger.info(f"Executing: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=False, text=True)
+
+        if result.returncode != 0:
+            logger.error("❌ Both Direct Kaggle REST API stream and Kaggle CLI download failed.")
+            sys.exit(1)
+
+    logger.info("Download completed successfully.")
     log_disk()
 
 # ──────────────────────────────────────────────────────────────
