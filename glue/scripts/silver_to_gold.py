@@ -511,7 +511,7 @@ def build_dim_business_hours(business_df):
             [], "BusinessID string, DayOfWeekNum int, DayOfWeek string, OpenTime string, CloseTime string"
         )
 
-    stack_args = ", ".join(f"'{name}', {num}, {c}" for c, name, num in existing)
+    stack_args = ", ".join(f"'{name}', {num}, `{c}`" for c, name, num in existing)
     stack_expr = f"stack({len(existing)}, {stack_args}) as (DayOfWeek, DayOfWeekNum, HoursStr)"
 
     long_df = business_df.select(F.col("business_id"), F.expr(stack_expr))
@@ -649,14 +649,14 @@ def run_bi(business_df, review_df, user_df, checkin_df):
 
     # ---- write ----
     logger.info("[BI] Writing gold tables...")
-    dim_date.coalesce(1).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_date/")
-    dim_business.coalesce(10).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_business/")
-    fact_business.coalesce(10).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_business/")
-    fact_review_trend.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_review_trend/")
-    fact_rating_distribution.coalesce(10).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_rating_distribution/")
-    dim_business_hours.coalesce(5).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/dim_business_hours/")
-    fact_checkin_day.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_checkin_day/")
-    fact_checkin_hour.coalesce(20).write.mode("overwrite").parquet(f"{GOLD_PATH_BI}/fact_checkin_hour/")
+    write_gold("BI", dim_date,                 GOLD_PATH_BI, "dim_date",                 num_output_files=1)
+    write_gold("BI", dim_business,             GOLD_PATH_BI, "dim_business",             num_output_files=10)
+    write_gold("BI", fact_business,            GOLD_PATH_BI, "fact_business",            num_output_files=10)
+    write_gold("BI", fact_review_trend,        GOLD_PATH_BI, "fact_review_trend",        num_output_files=20)
+    write_gold("BI", fact_rating_distribution, GOLD_PATH_BI, "fact_rating_distribution", num_output_files=10)
+    write_gold("BI", dim_business_hours,       GOLD_PATH_BI, "dim_business_hours",       num_output_files=5)
+    write_gold("BI", fact_checkin_day,         GOLD_PATH_BI, "fact_checkin_day",         num_output_files=20)
+    write_gold("BI", fact_checkin_hour,        GOLD_PATH_BI, "fact_checkin_hour",        num_output_files=20)
     checkin_exploded.unpersist()
     logger.info("[BI] All BI gold tables written.")
 

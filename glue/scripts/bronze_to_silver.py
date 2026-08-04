@@ -138,7 +138,7 @@ for dataset_name in DATASETS:
             log(f"Direct S3 read also failed: {e2}")
             continue
 
-    log(f"Raw Rows for {dataset_name}: {df.count():,}")
+    log(f"Read '{dataset_name}' from catalog/S3 successfully.")
 
     # ======================================================
     # FLATTEN STRUCTS

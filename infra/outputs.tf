@@ -19,8 +19,8 @@ output "glue_database_name" {
 }
 
 output "glue_silver_database_name" {
-  value       = module.glue.silver_crawler_name
-  description = "Glue Silver Crawler Name (runs between bronze_to_silver and silver_to_gold)"
+  value       = module.glue.silver_database_name
+  description = "Glue Catalog Silver Database Name (Silver Parquet tables)"
 }
 
 output "glue_gold_database_name" {

@@ -94,39 +94,51 @@ def start_and_wait_crawler(glue, crawler_name):
 
 def wait_for_glue_workflow(glue, workflow_name, timeout_minutes=90):
     """
-    Poll the Glue Workflow until it reaches a terminal state.
-    This prevents trigger_gold.py from starting silver_to_gold while
-    the Workflow's bronze_to_silver is still actively overwriting Silver files.
+    Wait until the Glue Workflow has no RUNNING executions.
+
+    Bug fixed vs. previous version: The old code checked `runs[0].Status` and
+    returned True if it was COMPLETED. But that run could be the PREVIOUS pipeline's
+    run (already done). This caused trigger_gold.py to proceed even though the
+    current bronze_to_silver was still mid-write — creating the race condition.
+
+    New logic: if ANY run is RUNNING, wait. Only proceed when all known runs are
+    in a terminal state (COMPLETED / STOPPED / ERROR) or there are no active runs.
     """
-    logger.info(f"Checking Glue Workflow '{workflow_name}' for any active runs ...")
+    logger.info(f"Checking Glue Workflow '{workflow_name}' for any active (RUNNING) executions ...")
     deadline = time.time() + timeout_minutes * 60
 
     while time.time() < deadline:
         try:
-            runs_resp = glue.get_workflow_runs(Name=workflow_name, MaxResults=1)
+            runs_resp = glue.get_workflow_runs(Name=workflow_name, MaxResults=10)
             runs = runs_resp.get("Runs", [])
+
             if not runs:
-                logger.info(f"No active Glue Workflow runs found for '{workflow_name}'. Proceeding.")
+                logger.info(f"No workflow runs found for '{workflow_name}'. Safe to proceed.")
                 return True
 
-            latest_run = runs[0]
-            run_id = latest_run["WorkflowRunId"]
-            status  = latest_run["Status"]
-            logger.info(f"  Workflow '{workflow_name}' run '{run_id}' Status: {status}")
+            running_runs = [r for r in runs if r.get("Status") == "RUNNING"]
 
-            if status in ("COMPLETED", "STOPPED", "ERROR"):
-                logger.info(f"✅ Glue Workflow '{workflow_name}' run finished with status: {status}")
-                return True
-            elif status == "RUNNING":
-                logger.info(f"  Workflow still RUNNING — waiting 30s before re-check ...")
+            if running_runs:
+                run_id = running_runs[0]["WorkflowRunId"]
+                logger.info(
+                    f"  Workflow '{workflow_name}' has {len(running_runs)} RUNNING execution(s). "
+                    f"Latest running RunId: {run_id} — waiting 30s ..."
+                )
             else:
-                logger.info(f"  Workflow status: {status} — waiting ...")
+                latest = runs[0]
+                logger.info(
+                    f"✅ No RUNNING executions in '{workflow_name}'. "
+                    f"Latest run '{latest['WorkflowRunId']}' is in terminal state: {latest.get('Status')}. "
+                    f"Safe to proceed."
+                )
+                return True
+
         except Exception as e:
             logger.warning(f"Error checking Glue Workflow status: {e}")
 
         time.sleep(30)
 
-    logger.error(f"❌ Timed out ({timeout_minutes}min) waiting for Glue Workflow '{workflow_name}' to complete.")
+    logger.error(f"❌ Timed out ({timeout_minutes}min) waiting for Glue Workflow '{workflow_name}' to finish.")
     sys.exit(1)
 
 

@@ -1,6 +1,11 @@
 output "database_name" {
   value       = aws_glue_catalog_database.yelp_db.name
-  description = "Glue Catalog Database Name"
+  description = "Glue Catalog Database Name (Bronze JSON)"
+}
+
+output "silver_database_name" {
+  value       = aws_glue_catalog_database.yelp_db_silver.name
+  description = "Glue Catalog Silver Database Name (Silver Parquet)"
 }
 
 output "workflow_name" {

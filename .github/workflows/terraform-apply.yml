@@ -55,24 +55,25 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -auto-approve
 
-      - name: Upload Glue Scripts to S3
-        # Upload Glue ETL scripts directly from runner to S3 scripts/ prefix
-        working-directory: .
-        run: |
-          BRONZE_BUCKET=$(cd infra && terraform output -raw bronze_bucket_name)
-          echo "Uploading Glue scripts to s3://${BRONZE_BUCKET}/scripts/"
-          aws s3 cp glue/scripts/bronze_to_silver.py s3://${BRONZE_BUCKET}/scripts/bronze_to_silver.py
-          aws s3 cp glue/scripts/silver_to_gold.py s3://${BRONZE_BUCKET}/scripts/silver_to_gold.py
-          echo "All Glue ETL scripts uploaded successfully."
-
       - name: Capture Terraform Outputs
         id: tf_outputs
         run: |
-          echo "bronze_bucket=$(terraform output -raw bronze_bucket_name)"       >> $GITHUB_OUTPUT
-          echo "silver_bucket=$(terraform output -raw silver_bucket_name)"       >> $GITHUB_OUTPUT
-          echo "gold_bucket=$(terraform output -raw gold_bucket_name)"           >> $GITHUB_OUTPUT
-          echo "glue_workflow=$(terraform output -raw glue_workflow_name)"       >> $GITHUB_OUTPUT
+          echo "bronze_bucket=$(terraform output -raw bronze_bucket_name)"        >> $GITHUB_OUTPUT
+          echo "silver_bucket=$(terraform output -raw silver_bucket_name)"        >> $GITHUB_OUTPUT
+          echo "gold_bucket=$(terraform output -raw gold_bucket_name)"            >> $GITHUB_OUTPUT
+          echo "glue_workflow=$(terraform output -raw glue_workflow_name)"        >> $GITHUB_OUTPUT
           echo "silver_crawler=$(terraform output -raw glue_silver_crawler_name)" >> $GITHUB_OUTPUT
+
+      - name: Upload Glue Scripts to S3
+        # Upload Glue ETL scripts from the runner to the Bronze S3 scripts/ prefix.
+        # Uses the captured bronze_bucket output so we don't re-invoke terraform.
+        working-directory: .
+        run: |
+          BRONZE_BUCKET="${{ steps.tf_outputs.outputs.bronze_bucket }}"
+          echo "Uploading Glue scripts to s3://${BRONZE_BUCKET}/scripts/"
+          aws s3 cp glue/scripts/bronze_to_silver.py s3://${BRONZE_BUCKET}/scripts/bronze_to_silver.py
+          aws s3 cp glue/scripts/silver_to_gold.py   s3://${BRONZE_BUCKET}/scripts/silver_to_gold.py
+          echo "All Glue ETL scripts uploaded successfully."
 
   # ────────────────────────────────────────────────────────────────────────
   # JOB 2 — Ingest: download from Kaggle → upload to Bronze S3 → trigger Glue
@@ -170,6 +171,7 @@ jobs:
           python ingestion/trigger_gold.py \
             "yelp-bigdata_silver_to_gold" \
             "yelp-bigdata_gold_crawler" \
-            "${{ needs.terraform.outputs.gold_bucket || 'yelp-gold-analytics-us-east-1' }}" \
-            "${{ needs.terraform.outputs.silver_crawler || 'yelp-bigdata_silver_crawler' }}"
+            "${{ needs.terraform.outputs.gold_bucket    || 'yelp-gold-analytics-us-east-1' }}" \
+            "${{ needs.terraform.outputs.silver_crawler || 'yelp-bigdata_silver_crawler' }}" \
+            "${{ needs.terraform.outputs.glue_workflow  || 'yelp-bigdata_etl_workflow' }}"
 
