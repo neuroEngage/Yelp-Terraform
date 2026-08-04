@@ -41,6 +41,7 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          GLUE_WORKFLOW_NAME: "yelp-bigdata_etl_workflow"
           TRIGGER_GLUE_WORKFLOW: ${{ github.event.inputs.trigger_glue_workflow }}
         run: |
           python ingestion/ingest.py
