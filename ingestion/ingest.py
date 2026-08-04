@@ -4,6 +4,7 @@ import glob
 import shutil
 import zipfile
 import logging
+import traceback
 import boto3
 from botocore.exceptions import ClientError
 
@@ -30,6 +31,10 @@ FILE_MAPPINGS = {
     "photos.json"                         : "photos.json",
 }
 
+def log_disk_space():
+    total, used, free = shutil.disk_usage("/")
+    logger.info(f"Disk Space — Total: {total // (2**30)} GB | Used: {used // (2**30)} GB | Free: {free // (2**30)} GB")
+
 def setup_kaggle_credentials():
     username = os.getenv("KAGGLE_USERNAME")
     key      = os.getenv("KAGGLE_KEY")
@@ -47,15 +52,18 @@ def setup_kaggle_credentials():
 
 def download_dataset():
     os.makedirs(TEMP_DIR, exist_ok=True)
+    log_disk_space()
     logger.info(f"Downloading Kaggle dataset '{DATASET_NAME}' ...")
     try:
         from kaggle.api.kaggle_api_extended import KaggleApi
         api = KaggleApi()
         api.authenticate()
-        api.dataset_download_files(DATASET_NAME, path=TEMP_DIR, unzip=False)
+        api.dataset_download_files(DATASET_NAME, path=TEMP_DIR, unzip=False, quiet=False)
         logger.info("Dataset download complete.")
+        log_disk_space()
     except Exception as e:
         logger.error(f"Kaggle download failed: {e}")
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 def extract_dataset():
@@ -65,6 +73,7 @@ def extract_dataset():
         logger.error("No ZIP file found after download.")
         sys.exit(1)
     for zf in zip_files:
+        logger.info(f"Unzipping {zf} ...")
         with zipfile.ZipFile(zf, "r") as z:
             # Extract everything EXCEPT the photos/ image folder
             members = [
@@ -74,6 +83,7 @@ def extract_dataset():
             z.extractall(TEMP_DIR, members=members)
             logger.info(f"Extracted {len(members)} entries (photos/ images excluded).")
         os.remove(zf)
+    log_disk_space()
 
 def upload_to_s3_bronze(bucket_name):
     s3 = boto3.client("s3")
@@ -106,6 +116,7 @@ def trigger_glue_workflow(workflow_name):
         logger.info(f"Glue Workflow started. RunId: {run_id}")
     except ClientError as e:
         logger.error(f"Failed to start Glue Workflow: {e}")
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 def main():
