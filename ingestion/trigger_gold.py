@@ -11,8 +11,10 @@ logging.basicConfig(
 logger = logging.getLogger("gold_etl_trigger")
 
 REGION = "us-east-1"
+BRONZE_TO_SILVER_JOB    = "yelp-bigdata_bronze_to_silver"
 SILVER_TO_GOLD_JOB_NAME = "yelp-bigdata_silver_to_gold"
 GOLD_CRAWLER_NAME       = "yelp-bigdata_gold_crawler"
+SILVER_BUCKET_NAME      = "yelp-silver-clean-us-east-1"
 GOLD_BUCKET_NAME        = "yelp-gold-analytics-us-east-1"
 
 def start_and_wait_glue_job(glue, job_name):
@@ -25,7 +27,6 @@ def start_and_wait_glue_job(glue, job_name):
         logger.error(f"Failed to start Glue Job '{job_name}': {e}")
         sys.exit(1)
 
-    # Poll status every 20 seconds
     while True:
         try:
             status_resp = glue.get_job_run(JobName=job_name, RunId=job_run_id)
@@ -56,7 +57,6 @@ def start_and_wait_crawler(glue, crawler_name):
             logger.error(f"Failed to start crawler '{crawler_name}': {e}")
             return False
 
-    # Poll status
     time.sleep(10)
     while True:
         try:
@@ -72,17 +72,30 @@ def start_and_wait_crawler(glue, crawler_name):
 
         time.sleep(15)
 
+def check_silver_ready(s3, silver_bucket):
+    """Ensures Silver Parquet tables exist before running Silver-to-Gold job."""
+    logger.info(f"Checking Silver Parquet tables in s3://{silver_bucket}/ ...")
+    try:
+        resp = s3.list_objects_v2(Bucket=silver_bucket, Prefix="silver/", MaxKeys=10)
+        contents = resp.get("Contents", [])
+        if len(contents) > 0:
+            logger.info(f"Silver bucket has {len(contents)}+ objects present.")
+            return True
+    except Exception as e:
+        logger.warning(f"Could not check Silver bucket: {e}")
+    return False
+
 def verify_gold_s3_data(s3, bucket_name):
     logger.info(f"Verifying Gold Parquet objects in s3://{bucket_name}/gold/ ...")
     try:
-        resp = s3.list_objects_v2(Bucket=bucket_name, Prefix="gold/", MaxKeys=30)
+        resp = s3.list_objects_v2(Bucket=bucket_name, Prefix="gold/", MaxKeys=50)
         contents = resp.get("Contents", [])
         if not contents:
             logger.error(f"❌ No objects found in s3://{bucket_name}/gold/")
             sys.exit(1)
 
         logger.info(f"🎉 GOLD BUCKET VERIFIED! Found {len(contents)} Gold datasets in S3:")
-        for obj in contents[:15]:
+        for obj in contents[:20]:
             size_mb = obj['Size'] / (1024 * 1024)
             logger.info(f"  - s3://{bucket_name}/{obj['Key']} ({size_mb:.2f} MB)")
     except Exception as e:
@@ -93,17 +106,22 @@ def main():
     glue = boto3.client("glue", region_name=REGION)
     s3   = boto3.client("s3",   region_name=REGION)
 
-    job_name     = sys.argv[1] if len(sys.argv) > 1 else SILVER_TO_GOLD_JOB_NAME
-    crawler_name = sys.argv[2] if len(sys.argv) > 2 else GOLD_CRAWLER_NAME
-    gold_bucket  = sys.argv[3] if len(sys.argv) > 3 else GOLD_BUCKET_NAME
+    gold_job_name = sys.argv[1] if len(sys.argv) > 1 else SILVER_TO_GOLD_JOB_NAME
+    crawler_name  = sys.argv[2] if len(sys.argv) > 2 else GOLD_CRAWLER_NAME
+    gold_bucket   = sys.argv[3] if len(sys.argv) > 3 else GOLD_BUCKET_NAME
 
-    # 1. Run Silver to Gold Job & wait for completion
-    start_and_wait_glue_job(glue, job_name)
+    # Step 1: Ensure Silver data is generated
+    if not check_silver_ready(s3, SILVER_BUCKET_NAME):
+        logger.info("Silver layer empty/missing. Running bronze_to_silver Glue job first...")
+        start_and_wait_glue_job(glue, BRONZE_TO_SILVER_JOB)
 
-    # 2. Run Gold Crawler to catalog Gold tables into yelp_db_gold
+    # Step 2: Run Silver to Gold Job & wait for completion
+    start_and_wait_glue_job(glue, gold_job_name)
+
+    # Step 3: Run Gold Crawler to catalog Gold tables into yelp_db_gold
     start_and_wait_crawler(glue, crawler_name)
 
-    # 3. Verify Parquet files land in S3 Gold bucket
+    # Step 4: Verify Parquet files land in S3 Gold bucket
     verify_gold_s3_data(s3, gold_bucket)
 
 if __name__ == "__main__":
