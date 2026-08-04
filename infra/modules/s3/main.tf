@@ -50,20 +50,3 @@ resource "aws_s3_bucket_public_access_block" "silver" {
   restrict_public_buckets = true
 }
 
-# ─────────────────────────────────────────────
-# SCRIPTS BUCKET PREFIX (Glue ETL scripts)
-# stored inside the bronze bucket /scripts/
-# ─────────────────────────────────────────────
-resource "aws_s3_object" "scripts_folder" {
-  bucket  = aws_s3_bucket.bronze.id
-  key     = "scripts/"
-  content = ""
-}
-
-# Upload the Glue scripts to bronze/scripts/
-resource "aws_s3_object" "bronze_to_silver_script" {
-  bucket = aws_s3_bucket.bronze.id
-  key    = "scripts/bronze_to_silver.py"
-  source = "${path.module}/../../../glue/scripts/bronze_to_silver.py"
-  etag   = filemd5("${path.module}/../../../glue/scripts/bronze_to_silver.py")
-}
