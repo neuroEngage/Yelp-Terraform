@@ -110,6 +110,17 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            us-east-1
 
+      - name: Setup Kaggle Credentials on Linux Runner
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+          echo "Kaggle credentials configured for user: $KAGGLE_USERNAME"
+          kaggle --version
+
       - name: Run Ingestion Script
         env:
           KAGGLE_USERNAME:    ${{ secrets.KAGGLE_USERNAME }}
