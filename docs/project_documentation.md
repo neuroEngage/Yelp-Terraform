@@ -8,36 +8,38 @@
 Developer pushes code to GitHub (main branch)
             │
             ▼
-   GitHub Actions triggers automatically
+   GitHub Actions triggers automatically (3 Sequential Jobs)
             │
-    ┌───────┴────────┐
-    │                │
-  Job 1            Job 2
-Terraform        Kaggle Ingest
-  Apply           (runs after
-    │              Job 1 done)
-    │                │
-    ▼                ▼
-AWS Infra      Downloads Yelp
-Provisioned    Dataset from
-               Kaggle API
-                    │
-                    ▼
-              Uploads raw JSON
-              → S3 Bronze Bucket
-                    │
-                    ▼
-              Triggers Glue Workflow
-                    │
-              ┌─────┴──────┐
-              │            │
-          Glue          Then Glue
-         Crawler          Job
-        (catalogs        (ETL)
-         bronze)          │
-              │            ▼
-              └──► Clean Parquet
-                   → S3 Silver Bucket
+    ┌───────┼────────────────────────┐
+    │       │                        │
+  Job 1   Job 2                    Job 3
+Terraform Kaggle Ingest            Silver to Gold ETL
+ Apply     (runs after Job 1)      (runs after Job 2)
+    │       │                        │
+    ▼       ▼                        ▼
+ AWS Infra Downloads Yelp           Waits for active Glue Workflow
+ Provision Dataset from Kaggle      Executes Silver Crawler
+            │                        Executes silver_to_gold PySpark Job
+            ▼                        Executes Gold Crawler
+     Uploads raw JSON                Verifies Gold S3 outputs
+     → S3 Bronze Bucket
+            │
+            ▼
+     Triggers AWS Glue Workflow
+            │
+     ┌──────┴──────────────────────────┐
+     │                                 │
+ [Step 1] Bronze Crawler           [Step 2] bronze_to_silver ETL
+ catalog raw JSON → yelp_db        writes clean Parquet → Silver S3
+                                       │
+                                   [Step 3] Silver Crawler
+                                   catalog Silver Parquet → yelp_db_silver
+                                       │
+                                   [Step 4] silver_to_gold ETL
+                                   writes BI + ML + RAG → Gold S3
+                                       │
+                                   [Step 5] Gold Crawler
+                                   catalog Gold Parquet → yelp_db_gold
 ```
 
 ---
@@ -48,37 +50,40 @@ Provisioned    Dataset from
 Yelp-Terraform/
 │
 ├── .github/workflows/           ← CI/CD automation (GitHub Actions)
-│   ├── terraform-apply.yml
-│   ├── terraform-plan.yml
-│   └── terraform-destroy.yml
+│   ├── terraform-apply.yml      # Main: 3-Job Pipeline (runs on push to main)
+│   ├── terraform-plan.yml       # Pull Request check: shows terraform plan
+│   └── terraform-destroy.yml    # Manual: teardown all AWS resources
 │
 ├── infra/                       ← Infrastructure as Code (Terraform)
-│   ├── backend.tf
-│   ├── provider.tf
-│   ├── versions.tf
-│   ├── variables.tf
-│   ├── terraform.tfvars
-│   ├── main.tf
-│   ├── outputs.tf
+│   ├── backend.tf               # Remote state storage in HCP Terraform
+│   ├── provider.tf              # AWS provider setup & default tags
+│   ├── versions.tf              # Terraform & AWS provider version constraints
+│   ├── variables.tf             # Input variable declarations
+│   ├── terraform.tfvars         # Project variable values
+│   ├── main.tf                  # Entry point calling s3 & glue modules
+│   ├── outputs.tf               # Terraform outputs captured by CI/CD
 │   └── modules/
-│       ├── s3/
+│       ├── s3/                  # Provisions Bronze, Silver, Gold buckets
 │       │   ├── main.tf
 │       │   ├── variables.tf
 │       │   └── outputs.tf
-│       └── glue/
+│       └── glue/                # Provisions Glue DBs, Crawlers, Jobs, Workflow
 │           ├── main.tf
 │           ├── variables.tf
 │           └── outputs.tf
 │
-├── ingestion/                   ← Python data acquisition
-│   ├── ingest.py
-│   └── requirements.txt
+├── ingestion/                   ← Python data acquisition & orchestration
+│   ├── ingest.py                # Kaggle download → S3 Bronze upload → Glue trigger
+│   ├── trigger_gold.py          # Workflow waiter, Silver crawler & Gold runner
+│   └── requirements.txt         # Ingestion dependencies
 │
-├── glue/scripts/                ← PySpark ETL
-│   └── bronze_to_silver.py
+├── glue/scripts/                ← PySpark ETL Scripts
+│   ├── bronze_to_silver.py      # PySpark ETL: raw JSON → clean Silver Parquet
+│   └── silver_to_gold.py        # PySpark ETL: Silver Parquet → Gold (BI + ML + RAG)
 │
-├── docs/
-│   └── architecture.md
+├── docs/                        ← Architecture & Documentation
+│   ├── architecture.md          # Medallion Lakehouse visual architecture
+│   └── project_documentation.md # Complete project documentation (this document)
 │
 ├── .gitignore
 └── README.md
@@ -92,25 +97,36 @@ Yelp-Terraform/
 
 **When it runs:** Every push to `main` branch, or manually from GitHub Actions UI.
 
-**What it does:** This is the master orchestration file. It runs two sequential jobs:
+**What it does:** Master orchestration pipeline running 3 sequential jobs:
 
-#### Job 1 — `Terraform Apply`
-- Checks out the code
-- Authenticates to AWS using GitHub Secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
-- Authenticates to HCP Terraform using `TF_API_TOKEN`
-- Runs `terraform init` → connects to HCP Terraform for remote state
-- Runs `terraform validate` → syntax check
-- Runs `terraform apply -auto-approve` → provisions all AWS infrastructure
-- Captures outputs (bucket names, workflow name) and passes them to Job 2
+#### Job 1 — `1 · Terraform Apply`
+- Checks out repository code.
+- Authenticates to AWS using GitHub Secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+- Authenticates to HCP Terraform using `TF_API_TOKEN`.
+- Runs `terraform init` → connects to HCP Terraform remote backend.
+- Runs `terraform validate` → syntax check.
+- Runs `terraform apply -auto-approve` → provisions all AWS S3 & Glue infrastructure.
+- Captures outputs (`bronze_bucket`, `silver_bucket`, `gold_bucket`, `glue_workflow`, `silver_crawler`).
+- Uploads Glue ETL scripts from runner to `s3://<bronze_bucket>/scripts/`.
 
-#### Job 2 — `Kaggle Ingest → S3 Bronze → Glue`
-- Only runs **after Job 1 succeeds** (`needs: terraform`)
-- Installs Python dependencies
+#### Job 2 — `2 · Kaggle Ingest → S3 Bronze → Glue`
+- Runs **after Job 1 succeeds** (`needs: terraform`).
+- Configures Kaggle API credentials on runner.
 - Runs `ingestion/ingest.py` with env vars:
-  - `KAGGLE_USERNAME`, `KAGGLE_KEY` → for dataset download
+  - `KAGGLE_USERNAME`, `KAGGLE_KEY` → dataset access
   - `BRONZE_BUCKET_NAME` → dynamically from Terraform output
   - `GLUE_WORKFLOW_NAME` → dynamically from Terraform output
-  - `TRIGGER_GLUE: "true"` → automatically triggers ETL after upload
+  - `TRIGGER_GLUE: "true"` → triggers AWS Glue Workflow async after upload.
+
+#### Job 3 — `3 · Silver to Gold ETL → Gold S3 Verification`
+- Runs **after Job 2 succeeds** (`needs: [terraform, ingest]`).
+- Executes `ingestion/trigger_gold.py` passing dynamic arguments from Job 1 outputs.
+- Waits for any running Glue Workflow executions to complete (prevents file read/write race conditions).
+- Verifies presence of all required Silver datasets (`business`, `review`, `user`, `checkin`).
+- Triggers and monitors `silver_crawler` to catalog latest Silver schema.
+- Triggers and monitors `silver_to_gold` PySpark Glue job.
+- Triggers and monitors `gold_crawler` to catalog final Gold tables.
+- Verifies Parquet objects generated under `s3://<gold_bucket>/gold/`.
 
 ---
 
@@ -119,362 +135,175 @@ Yelp-Terraform/
 **When it runs:** Every Pull Request targeting `main`.
 
 **What it does:**
-- Runs `terraform init` + `terraform validate` + `terraform plan`
-- Shows what infrastructure changes *would* happen before you merge
-- Does **not** apply anything — read-only preview
-- Prevents broken Terraform code from reaching main
+- Runs `terraform init` + `terraform validate` + `terraform plan`.
+- Previews proposed infrastructure changes before merging.
+- Read-only check — does not alter AWS infrastructure.
 
 ---
 
 ### `terraform-destroy.yml` — Teardown Workflow
 
-**When it runs:** Manually only (`workflow_dispatch`) — you click a button in GitHub Actions.
+**When it runs:** Manually only (`workflow_dispatch`).
 
 **What it does:**
-- Runs `terraform destroy -auto-approve`
-- Deletes all AWS resources: both S3 buckets, Glue DB, Crawler, Job, Workflow
-- Used at end of AWS Academy lab session to avoid wasting credits
+- Runs `terraform destroy -auto-approve`.
+- Safely deletes all S3 buckets, Glue DBs, Crawlers, Jobs, and Workflows.
+- Used to clean up AWS Academy lab sessions.
 
 ---
 
 ## 4. Infrastructure as Code (`infra/`)
 
-### `backend.tf` — Remote State Storage
+### Module Overview
 
-```hcl
-terraform {
-  cloud {
-    organization = "cdac-bda-group06"
-    workspaces {
-      name = "yelp-bigdata-workspace"
-    }
-  }
-}
-```
+- **S3 Module (`infra/modules/s3/`)**: Provisions 3 S3 buckets (`yelp-bronze-raw-us-east-1`, `yelp-silver-clean-us-east-1`, `yelp-gold-analytics-us-east-1`) with AES-256 server-side encryption and public access blocks.
+- **Glue Module (`infra/modules/glue/`)**: Provisions 3 Catalog Databases (`yelp_db`, `yelp_db_silver`, `yelp_db_gold`), 3 Crawlers, 2 PySpark Jobs, and the Glue Workflow.
 
-**Purpose:** Instead of storing the Terraform state file (`.tfstate`) locally or in GitHub, it is stored remotely in **HCP Terraform** (app.terraform.io). The state file tracks all AWS resources Terraform has created. Storing it in HCP means:
-- Multiple runs don't conflict
-- State is never lost even if CI runner is destroyed
-- Locking prevents two runs from applying simultaneously
+### Glue Databases & Crawlers
+
+| Catalog DB Name | Associated Crawler | S3 Source Path | Purpose |
+|---|---|---|---|
+| `yelp_db` | `yelp-bigdata_bronze_crawler` | `s3://<bronze_bucket>/` | Catalogs raw JSON files (excludes `scripts/`) |
+| `yelp_db_silver` | `yelp-bigdata_silver_crawler` | `s3://<silver_bucket>/silver/` | Catalogs cleaned Parquet Silver tables |
+| `yelp_db_gold` | `yelp-bigdata_gold_crawler` | `s3://<gold_bucket>/gold/` | Catalogs BI, ML, and RAG Gold Parquet tables |
 
 ---
 
-### `provider.tf` — AWS Provider Configuration
+## 5. Ingestion & Orchestration Layer (`ingestion/`)
 
-**Purpose:** Tells Terraform which cloud to talk to (AWS), which region to use (`us-east-1`), and applies default tags (`Project`, `Environment`, `ManagedBy`) to every AWS resource automatically.
+### `ingest.py` — Data Acquisition Engine
+1. Authenticates with Kaggle REST API stream (fallback to Kaggle CLI).
+2. Downloads `adamamer2001/yelp-complete-open-dataset-2024` archive.
+3. Extracts raw JSON datasets (`business`, `review`, `user`, `tip`, `checkin`, `photos`), skipping images.
+4. Uploads raw JSON files to `s3://<bronze_bucket>/`.
+5. Triggers AWS Glue Workflow (`start_workflow_run`) and cleans up runner disk space.
 
----
-
-### `versions.tf` — Terraform & Provider Version Constraints
-
-**Purpose:** Pins the minimum version of Terraform (`>= 1.5.0`) and the AWS provider (`~> 5.0`). This prevents unexpected breakage if a new version introduces breaking changes.
-
----
-
-### `variables.tf` — Input Variable Declarations
-
-**Purpose:** Declares all configurable inputs the Terraform root module accepts:
-
-| Variable | Type | Purpose |
-|---|---|---|
-| `aws_region` | string | AWS region (default: `us-east-1`) |
-| `project_name` | string | Used as prefix for all resource names |
-| `environment` | string | `dev`, `staging`, `prod` |
-| `bronze_bucket_name` | string | Name of the raw data S3 bucket |
-| `silver_bucket_name` | string | Name of the S3 Silver bucket |
-| `glue_service_role_arn` | string | IAM role ARN for Glue (uses AWS Academy LabRole) |
+### `trigger_gold.py` — Pipeline Monitor & Race Condition Shield
+1. **`wait_for_glue_workflow()`**: Polls AWS Glue Workflow until `RUNNING` executions count drops to zero. Fixes file-not-found issues caused by concurrent writes.
+2. **`check_silver_all_datasets()`**: Confirms presence of `.parquet` files under `silver/business/`, `silver/review/`, `silver/user/`, and `silver/checkin/`.
+3. **`start_and_wait_crawler()`**: Runs Glue Crawlers and blocks until state reaches `READY`.
+4. **`start_and_wait_glue_job()`**: Runs Glue PySpark Jobs and polls execution status (`SUCCEEDED` / `FAILED`).
+5. **`verify_gold_s3_data()`**: Confirms generated Gold datasets in S3.
 
 ---
 
-### `terraform.tfvars` — Variable Values
+## 6. PySpark ETL Engine (`glue/scripts/`)
 
-**Purpose:** The actual values assigned to the variables declared above. This is the file you edit to change bucket names, regions, or the role ARN.
-
-```hcl
-bronze_bucket_name    = "yelp-bronze-raw-us-east-1"
-silver_bucket_name    = "yelp-silver-clean-us-east-1"
-glue_service_role_arn = "arn:aws:iam::339712764081:role/LabRole"
-```
-
-> **Important:** This file is committed to Git. Never put secrets here — secrets go in GitHub Secrets.
-
----
-
-### `main.tf` — Root Module Entry Point
-
-**Purpose:** Wires the child modules together. Calls the `s3` and `glue` modules, passing outputs from `s3` as inputs to `glue`.
-
-```
-main.tf
-  ├── calls module "s3"  → creates both buckets
-  └── calls module "glue"
-          ├── receives bronze_bucket_id from s3 module
-          └── receives silver_bucket_id from s3 module
-```
+### `bronze_to_silver.py` — Raw JSON to Clean Parquet
+- **Source**: `yelp_db` catalog / Bronze S3
+- **Target**: `s3://<silver_bucket>/silver/<dataset>/`
+- **Key Operations**:
+  - `flatten_df()`: Recursively expands nested StructType fields into flat columns.
+  - `clean_string_columns()`: Trims strings and converts empty strings to `null`.
+  - Column name standardization (`snake_case`).
+  - Deduplication on primary keys (`business_id`, `review_id`, `user_id`).
+  - Computes `weighted_score` for reviews based on rating and engagement votes (`useful`, `funny`, `cool`).
+  - Appends `etl_processed_timestamp`.
 
 ---
 
-### `outputs.tf` — Published Values
+### `silver_to_gold.py` — Consolidated Silver to Gold Transformation
 
-**Purpose:** Exposes key values after `terraform apply` runs. These are captured in GitHub Actions and passed to the ingest job:
-- `bronze_bucket_name` → passed to `ingest.py` as `BRONZE_BUCKET_NAME`
-- `glue_workflow_name` → passed to `ingest.py` as `GLUE_WORKFLOW_NAME`
+**Source**: `s3://<silver_bucket>/silver/` (reads with `mergeSchema=True`)  
+**Target**: `s3://<gold_bucket>/gold/` divided into `bi/`, `ml/`, and `rag/`
 
----
-
-## 5. S3 Module (`infra/modules/s3/`)
-
-### `main.tf` — Creates Both S3 Buckets
-
-**Purpose:** Provisions two completely separate S3 buckets:
-
-#### Bronze Bucket (`yelp-bronze-raw-us-east-1`)
-- Stores raw JSON files exactly as downloaded from Kaggle
-- Also stores the Glue ETL script at `scripts/bronze_to_silver.py`
-- Server-side encryption (AES-256) enabled
-- All public access blocked
-
-#### Silver Bucket (`yelp-silver-clean-us-east-1`)
-- Stores cleaned, flattened Parquet files output by the Glue job
-- Organized as `/<table_name>/` (e.g. `/business/`, `/review/`)
-- Server-side encryption (AES-256) enabled
-- All public access blocked
-
-The module also uploads `bronze_to_silver.py` from `glue/scripts/` to `s3://yelp-bronze-raw-us-east-1/scripts/`. Glue reads the script from this S3 path.
-
-### `variables.tf` / `outputs.tf`
-Accepts bucket names, outputs bucket IDs and ARNs for use by the Glue module.
+#### Key Transformations & Architectural Improvements
+1. **Shared Cached Reads**: Reads `business`, `review`, `user`, and `checkin` once from Silver, caches them in memory, and reuses across BI, ML, and RAG branches.
+2. **Checkin Date Explosion (`explode_checkin()`)**: Splits raw Yelp comma-separated checkin date strings (`"2016-04-26 19:49:16, 2016-08-30 18:36:57"`) into individual timestamp rows, enabling accurate time-based aggregation.
+3. **Distributed Hours Pivot (`build_dim_business_hours()`)**: Uses Spark `stack()` SQL expression for 100% in-memory distributed pivoting without driver `collect()`.
 
 ---
 
-## 6. Glue Module (`infra/modules/glue/`)
+### Gold Layer Output Datasets Detailed
 
-### `main.tf` — Creates the Entire ETL Infrastructure
+#### 1. BI Star Schema (`gold/bi/`)
+- `dim_date`: Calendar dimension table (DateKey, Month, Quarter, Year, DayOfWeek, WeekOfYear).
+- `dim_business`: Business dimension table (BusinessID, BusinessName, City, State, PrimaryCategory, Categories).
+- `dim_business_hours`: Operating hours per day of week (BusinessID, DayOfWeekNum, DayOfWeek, OpenTime, CloseTime).
+- `fact_business`: Business performance summary (ReviewCount, AvgRating, CheckinCount, BusinessHealthScore, CustomerEngagementScore).
+- `fact_review_trend`: Time-series review metrics aggregated by date.
+- `fact_rating_distribution`: Review counts grouped by star rating values per business.
+- `fact_checkin_day`: Aggregated check-in volume by day of week.
+- `fact_checkin_hour`: Aggregated check-in volume by hour of day.
 
-**Purpose:** Provisions all AWS Glue resources in the correct dependency order.
+#### 2. ML Feature Store (`gold/ml/`)
+- `sentiment_features`: Cleaned review text, character/word counts, punctuation ratios, sentiment labels (`positive`, `neutral`, `negative`), partitioned by `review_year`.
+- `rating_prediction`: User rating bias, tenure, elite status, business review count, and target star rating for regression models.
+- `collaborative_filtering`: Interaction matrix (`user_id`, `business_id`, `stars`, `weighted_score`) for ALS recommendation algorithms.
+- `content_based_filtering`: Business metadata, categories, location, and attribute flags for content-based similarity models.
+- `customer_segmentation`: Aggregated user features (`avg_stars_given`, `rating_variance`, `distinct_businesses_reviewed`, `user_tenure_years`) for user clustering (RFM/behavioral).
 
-#### Glue Catalog Database (`yelp_db`)
-- A logical container in the AWS Glue Data Catalog
-- Stores metadata (schema, location) of all tables
-- Think of it as the "database name" when querying with Athena
+#### 3. RAG Documents (`gold/rag/`)
+- `business_documents`: Rich formatted text chunks (`document_id`, `business_id`, `document_text`, `document_type='business'`) combining location, categories, operating hours, and features for LLM context retrieval.
+- `review_documents`: Structured review text chunks (`document_id`, `review_id`, `business_id`, `user_id`, `sentiment`, `document_text`, `document_type='review'`) for vector search indexing.
 
-#### IAM Role (conditional)
-- If `glue_service_role_arn` is empty → Terraform creates a new role with S3 + Glue permissions
-- If `glue_service_role_arn` is set (LabRole) → Terraform **skips** creating a role and uses the existing one
-- This is the AWS Academy compatibility pattern
+---
 
-#### Glue Crawler (`yelp-bigdata_bronze_crawler`)
-- Points to `s3://yelp-bronze-raw-us-east-1/` (excludes `scripts/` prefix)
-- When run: scans the JSON files, infers schemas, and registers tables in `yelp_db`
-- Table names created: `yelp_academic_dataset_business_json`, `yelp_academic_dataset_review_json`, etc.
-- These exact table names are what `bronze_to_silver.py` reads from
-
-#### Glue Job (`yelp-bigdata_bronze_to_silver`)
-- Glue version 4.0, Spark engine, G.1X workers (1 vCPU, 8 GB RAM each), 2 workers
-- Script location: `s3://yelp-bronze-raw-us-east-1/scripts/bronze_to_silver.py`
-- Job arguments: `--S3_BUCKET` = silver bucket name, `--DATABASE_NAME` = `yelp_db`
-
-#### Glue Workflow (`yelp-bigdata_etl_workflow`)
-- Triggered by `ingest.py` using `boto3 glue.start_workflow_run()`
-- Chains Crawler → Job sequentially
-
-#### Glue Triggers (chained)
+## 7. End-to-End Execution Sequence
 
 ```
-Workflow Started (ON_DEMAND)
-        │
-  Trigger 1: start_crawler      ← fires immediately
-        │
-  Glue Crawler runs
-        │ (SUCCEEDED)
-  Trigger 2: start_bronze_to_silver  ← fires after crawler
-        │
-  Glue Job runs (bronze_to_silver.py)
+[GitHub Push to main]
+       │
+       ▼
+[Job 1: Terraform Apply]
+  ├── Provision S3 Buckets (Bronze, Silver, Gold)
+  ├── Provision Glue DBs (yelp_db, yelp_db_silver, yelp_db_gold)
+  ├── Provision Glue Crawlers (bronze, silver, gold)
+  ├── Provision Glue Jobs (bronze_to_silver, silver_to_gold)
+  └── Upload PySpark Scripts to s3://<bronze_bucket>/scripts/
+       │
+       ▼
+[Job 2: Kaggle Ingest]
+  ├── Download & Extract Kaggle Yelp Dataset
+  ├── Upload JSON files to s3://<bronze_bucket>/
+  └── Start AWS Glue Workflow (Async)
+           │
+           ├── [Step 1] bronze_crawler scans S3 → updates yelp_db
+           └── [Step 2] bronze_to_silver job runs → writes Parquet to Silver S3
+       │
+       ▼
+[Job 3: Silver-to-Gold ETL]
+  ├── Wait for Glue Workflow completion (wait_for_glue_workflow)
+  ├── Verify Silver Datasets present (check_silver_all_datasets)
+  ├── Run silver_crawler → updates yelp_db_silver schema
+  ├── Run silver_to_gold PySpark Job → writes BI/ML/RAG Parquet to Gold S3
+  ├── Run gold_crawler → updates yelp_db_gold schema
+  └── Verify Gold S3 Outputs
 ```
 
 ---
 
-## 7. Ingestion Layer (`ingestion/`)
+## 8. Credentials & Secrets Management
 
-### `requirements.txt`
+### GitHub Repository Secrets (`Settings → Secrets and variables → Actions`)
 
-| Package | Purpose |
+| Secret Name | Purpose |
 |---|---|
-| `kaggle` | Kaggle Python API client |
-| `boto3` | AWS SDK for Python (S3 upload, Glue trigger) |
-| `requests` | HTTP client |
-| `tqdm` | Download progress bars |
+| `AWS_ACCESS_KEY_ID` | AWS IAM Access Key |
+| `AWS_SECRET_ACCESS_KEY` | AWS IAM Secret Access Key |
+| `AWS_SESSION_TOKEN` | AWS IAM Session Token (for temporary lab credentials) |
+| `KAGGLE_USERNAME` | Kaggle API account username |
+| `KAGGLE_KEY` | Kaggle API account key |
+| `TF_API_TOKEN` | HCP Terraform API token for remote state management |
 
 ---
 
-### `ingest.py` — The Data Acquisition Engine
+## 9. Verification & Querying Gold Data
 
-**Purpose:** A Python script that downloads the Yelp dataset from Kaggle and uploads it to S3 Bronze, then triggers the Glue ETL Workflow.
+Once the pipeline completes, you can query the Gold Layer directly in AWS Athena:
 
-**Step-by-step:**
-
-| Step | What happens |
-|---|---|
-| 1 | Reads `KAGGLE_USERNAME` + `KAGGLE_KEY` env vars, writes `~/.kaggle/kaggle.json` |
-| 2 | Downloads `adamamer2001/yelp-complete-open-dataset-2024` (~11 GB ZIP) to temp dir |
-| 3 | Extracts ZIP, skipping `photos/` images — keeps only JSON files |
-| 4 | Uploads 6 JSON files to `s3://yelp-bronze-raw-us-east-1/<filename>` |
-| 5 | Calls `boto3 glue.start_workflow_run(Name=GLUE_WORKFLOW_NAME)` |
-| 6 | Deletes temp dir |
-
-**Files uploaded:**
+```sql
+-- Query BI Star Schema Fact Table
+SELECT 
+    b.BusinessName,
+    b.City,
+    b.State,
+    f.AvgRating,
+    f.ReviewCount,
+    f.BusinessHealthScore,
+    f.HealthStatus
+FROM yelp_db_gold.fact_business f
+JOIN yelp_db_gold.dim_business b ON f.BusinessID = b.BusinessID
+ORDER BY f.BusinessHealthScore DESC
+LIMIT 20;
 ```
-yelp_academic_dataset_business.json
-yelp_academic_dataset_review.json
-yelp_academic_dataset_user.json
-yelp_academic_dataset_tip.json
-yelp_academic_dataset_checkin.json
-photos.json
-```
-
----
-
-## 8. Glue ETL Script (`glue/scripts/`)
-
-### `bronze_to_silver.py` — PySpark ETL: Raw JSON → Clean Parquet
-
-**Reads from:** Glue Data Catalog (`yelp_db`) via `create_dynamic_frame.from_catalog()`
-**Writes to:** `s3://yelp-silver-clean-us-east-1/<table>/` (Parquet, Snappy compressed)
-
-#### Helper Functions
-
-| Function | What it does |
-|---|---|
-| `log(msg)` | Prefixed print for Glue CloudWatch logs |
-| `standardize_column_name(name)` | Strips spaces, special chars, converts to `snake_case` |
-| `flatten_df(df)` | Recursively expands nested StructType columns into flat columns |
-| `clean_string_columns(df)` | Trims whitespace, converts empty strings to `null` |
-
-#### Per-Table Processing
-
-| Table | Key Transformations |
-|---|---|
-| **business** | Filter null `business_id`, dedup, cast `stars`/`review_count`/lat/long/`is_open`, flatten nested structs |
-| **review** | Filter null `review_id`, dedup, parse timestamp, extract date & time, cast stars, fill `useful/funny/cool` with 0, compute `weighted_score` (0–10) |
-| **user** | Filter null `user_id`, dedup, parse `yelping_since` as full timestamp |
-| **checkin** | Filter null `business_id`, dedup |
-| **tip** | Parse `date` timestamp, cast `compliment_count`, filter nulls, add `text_length` |
-| **all** | Add `etl_processed_timestamp` column, write Parquet with Snappy compression |
-
-#### `weighted_score` formula (review table)
-```
-weighted_score = LEAST(
-    (0.7 × (stars / 5) + 0.3 × ((useful + funny + cool) / 30)) × 10,
-    10
-)
-```
-Capped at 10 to handle edge cases where engagement votes are very high.
-
----
-
-## 9. Supporting Files
-
-### `.gitignore`
-Excludes: `.terraform/`, `*.tfstate`, `*.tfstate.backup`, `temp_yelp_data/`, `*.zip`, Python cache, OS metadata files.
-
-### `docs/architecture.md`
-Visual pipeline diagram and AWS service mapping. Used for project report.
-
-### `README.md`
-Project overview, structure, secrets reference, S3 layout after pipeline runs, and teardown instructions.
-
----
-
-## 10. End-to-End Data Flow Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  git push to main                                                │
-└───────────────────────────┬──────────────────────────────────────┘
-                            │
-               ┌────────────▼────────────┐
-               │   terraform-apply.yml   │
-               │   (GitHub Actions)      │
-               └────────────┬────────────┘
-                            │
-             ┌──────────────▼──────────────┐
-             │         JOB 1               │
-             │      Terraform Apply        │
-             │                             │
-             │  State ←→ HCP Terraform     │
-             │  Creates on AWS:            │
-             │  ┌─────────────────────┐    │
-             │  │ S3 Bronze Bucket    │    │
-             │  │ S3 Silver Bucket    │    │
-             │  │ Glue Catalog DB     │    │
-             │  │ Glue Crawler        │    │
-             │  │ Glue Job            │    │
-             │  │ Glue Workflow       │    │
-             │  │ ETL script → S3     │    │
-             │  └─────────────────────┘    │
-             └──────────────┬──────────────┘
-                            │ outputs: bucket + workflow names
-             ┌──────────────▼──────────────┐
-             │         JOB 2               │
-             │     ingest.py runs          │
-             │                             │
-             │  Kaggle API                 │
-             │  ↓ download ZIP (~11 GB)    │
-             │  ↓ extract, skip photos/    │
-             │  ↓ upload 6 JSON files      │
-             │    → S3 Bronze              │
-             │  ↓ trigger Glue Workflow    │
-             └──────────────┬──────────────┘
-                            │
-             ┌──────────────▼──────────────┐
-             │    AWS Glue Workflow         │
-             │                             │
-             │  [1] Glue Crawler           │
-             │      scans Bronze S3        │
-             │      → registers tables     │
-             │        in yelp_db           │
-             │                             │
-             │  [2] Glue Job               │
-             │      bronze_to_silver.py    │
-             │      reads yelp_db tables   │
-             │      → flatten / clean      │
-             │      → write Parquet        │
-             │        → S3 Silver          │
-             └──────────────┬──────────────┘
-                            │
-             ┌──────────────▼──────────────┐
-             │   S3 Silver Bucket          │
-             │   yelp-silver-clean-*       │
-             │                             │
-             │   /business/  *.parquet     │
-             │   /review/    *.parquet     │
-             │   /user/      *.parquet     │
-             │   /tip/       *.parquet     │
-             │   /checkin/   *.parquet     │
-             └─────────────────────────────┘
-```
-
----
-
-## 11. GitHub Secrets & HCP Variables Reference
-
-### GitHub Secrets (`Settings → Secrets → Actions`)
-
-| Secret | Used By |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | GitHub Actions: AWS auth |
-| `AWS_SECRET_ACCESS_KEY` | GitHub Actions: AWS auth |
-| `AWS_SESSION_TOKEN` | GitHub Actions: AWS auth |
-| `KAGGLE_USERNAME` | `ingest.py` |
-| `KAGGLE_KEY` | `ingest.py` |
-| `TF_API_TOKEN` | Terraform CLI → HCP auth |
-
-### HCP Terraform Workspace Variables (`Environment variable` type)
-
-| Key | Type |
-|---|---|
-| `AWS_ACCESS_KEY_ID` | Environment variable ✅ |
-| `AWS_SECRET_ACCESS_KEY` | Environment variable ✅ |
-| `AWS_SESSION_TOKEN` | Environment variable ✅ |
-
-> ⚠️ **AWS Academy:** Update all three AWS credentials (GitHub Secrets + HCP Variables) every time you start a new lab session — they expire when the session ends.
