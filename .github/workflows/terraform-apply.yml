@@ -52,16 +52,15 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -auto-approve
 
-      - name: Upload Glue Script to S3
-        # Upload bronze_to_silver.py directly from the runner (HCP remote exec
-        # can't access files outside ./infra, so we do this via AWS CLI here)
+      - name: Upload Glue Scripts to S3
+        # Upload Glue ETL scripts directly from runner to S3 scripts/ prefix
         working-directory: .
         run: |
           BRONZE_BUCKET=$(cd infra && terraform output -raw bronze_bucket_name)
-          echo "Uploading bronze_to_silver.py to s3://${BRONZE_BUCKET}/scripts/"
-          aws s3 cp glue/scripts/bronze_to_silver.py \
-            s3://${BRONZE_BUCKET}/scripts/bronze_to_silver.py
-          echo "Script uploaded successfully."
+          echo "Uploading Glue scripts to s3://${BRONZE_BUCKET}/scripts/"
+          aws s3 cp glue/scripts/bronze_to_silver.py s3://${BRONZE_BUCKET}/scripts/bronze_to_silver.py
+          aws s3 cp glue/scripts/silver_to_gold.py s3://${BRONZE_BUCKET}/scripts/silver_to_gold.py
+          echo "All Glue ETL scripts uploaded successfully."
 
       - name: Capture Terraform Outputs
         id: tf_outputs

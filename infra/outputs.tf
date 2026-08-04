@@ -8,9 +8,19 @@ output "silver_bucket_name" {
   description = "S3 Silver Bucket (cleaned Parquet from Glue)"
 }
 
+output "gold_bucket_name" {
+  value       = module.s3.gold_bucket_id
+  description = "S3 Gold Bucket (analytics BI/ML/RAG Parquet from Glue)"
+}
+
 output "glue_database_name" {
   value       = module.glue.database_name
-  description = "Glue Catalog Database Name"
+  description = "Glue Catalog Database Name (Bronze JSON)"
+}
+
+output "glue_gold_database_name" {
+  value       = module.glue.gold_database_name
+  description = "Glue Catalog Gold Database Name (BI/ML/RAG Parquet)"
 }
 
 output "glue_workflow_name" {

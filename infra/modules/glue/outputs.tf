@@ -17,3 +17,18 @@ output "bronze_crawler_name" {
   value       = aws_glue_crawler.bronze_crawler.name
   description = "Glue Crawler Name for Bronze layer"
 }
+
+output "gold_database_name" {
+  value       = aws_glue_catalog_database.yelp_db_gold.name
+  description = "Glue Catalog Gold Database Name"
+}
+
+output "silver_to_gold_job_name" {
+  value       = aws_glue_job.silver_to_gold.name
+  description = "Glue Job: Silver to Gold"
+}
+
+output "gold_crawler_name" {
+  value       = aws_glue_crawler.gold_crawler.name
+  description = "Glue Crawler Name for Gold layer"
+}
