@@ -6,6 +6,7 @@ import zipfile
 import subprocess
 import logging
 import traceback
+import requests
 import boto3
 from botocore.exceptions import ClientError
 
@@ -51,13 +52,58 @@ def setup_kaggle_credentials():
         f.write(f'{{"username":"{username}","key":"{key}"}}')
     os.chmod(kaggle_json, 0o600)
     logger.info(f"Kaggle credentials written for user: {username}")
+    return username, key
 
 # ──────────────────────────────────────────────────────────────
-def download_dataset():
+def download_via_http_direct(username, key):
+    """Bypasses Kaggle CLI bugs by querying the Kaggle REST API directly over HTTP stream."""
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{DATASET_NAME}"
+    logger.info(f"Direct HTTP streaming download from: {url}")
+    
+    zip_path = os.path.join(TEMP_DIR, "yelp_dataset.zip")
+    
+    try:
+        response = requests.get(
+            url,
+            auth=(username, key),
+            stream=True,
+            allow_redirects=True,
+            timeout=30
+        )
+        logger.info(f"Kaggle HTTP API response status code: {response.status_code}")
+        
+        if response.status_code != 200:
+            logger.error(f"❌ Kaggle Direct HTTP API failed with Status {response.status_code}")
+            logger.error(f"Response snippet: {response.text[:500]}")
+            return False
+
+        content_length = response.headers.get('content-length')
+        total_size = int(content_length) if content_length else 0
+        logger.info(f"Downloading stream (Size: {total_size >> 20} MB) ...")
+
+        downloaded = 0
+        with open(zip_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1048576): # 1MB chunks
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0 and downloaded % (50 * 1048576) == 0:
+                        logger.info(f"  Downloaded: {downloaded >> 20} MB / {total_size >> 20} MB ({(downloaded/total_size)*100:.1f}%)")
+        
+        logger.info(f"Direct HTTP download completed successfully: {zip_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"HTTP Direct Download failed: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+# ──────────────────────────────────────────────────────────────
+def download_dataset(username, key):
     os.makedirs(TEMP_DIR, exist_ok=True)
     log_disk()
 
-    logger.info(f"Downloading real Kaggle dataset '{DATASET_NAME}' ...")
+    logger.info(f"Attempting Kaggle CLI download for '{DATASET_NAME}' ...")
     cmd = [
         "kaggle", "datasets", "download",
         "-d", DATASET_NAME,
@@ -67,11 +113,18 @@ def download_dataset():
     logger.info(f"Executing: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=False, text=True)
 
-    if result.returncode != 0:
-        logger.error("❌ Kaggle CLI download failed.")
+    if result.returncode == 0:
+        logger.info("Kaggle CLI download completed successfully.")
+        log_disk()
+        return
+
+    logger.warning("Kaggle CLI download returned non-zero exit code. Switching to Direct HTTP REST API stream...")
+    success = download_via_http_direct(username, key)
+    
+    if not success:
+        logger.error("❌ Both Kaggle CLI and Direct HTTP REST API download failed.")
         sys.exit(1)
 
-    logger.info("Kaggle download complete.")
     log_disk()
 
 # ──────────────────────────────────────────────────────────────
@@ -143,8 +196,8 @@ def main():
     trigger_glue  = os.getenv("TRIGGER_GLUE", "true").lower() == "true"
 
     try:
-        setup_kaggle_credentials()
-        download_dataset()
+        username, key = setup_kaggle_credentials()
+        download_dataset(username, key)
         extract_dataset()
         upload_to_s3(bronze_bucket)
         if trigger_glue:
